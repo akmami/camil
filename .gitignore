@@ -1,0 +1,9 @@
+build/
+camil
+*.o
+*.d
+
+tests
+
+# index files
+*.cidx
