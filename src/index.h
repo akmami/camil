@@ -77,6 +77,12 @@ extern "C" {
 // upper bound on the number of sequence bases queued for parsing at any one time
 #define CAMIL_INDEX_INFLIGHT_BASES (1024ull * 1024ull * 1024ull)
 
+// fraction of the label space an index may fill before the chance of accidental core matches is worth reporting
+#define CAMIL_COLLISION_WARN 0.01
+
+// representative core count per read, used only to turn the per core collision rate into a per read one in the warning
+#define CAMIL_COLLISION_READ_CORES 20
+
 
 struct camil_index {
 	int lcp_level;       // LCP level used for every reference and every read
@@ -107,6 +113,10 @@ uint64_t camil_index_size(const struct camil_index *index);
 
 // writes a short human readable description of the index to stderr: level, sharing limit, genome names and the number of retained cores
 void camil_index_report(const struct camil_index *index);
+
+// warns when the index fills enough of the label space that chance matches
+// start to matter. Called by camil_index_report()
+void camil_index_warn_collisions(const struct camil_index *index);
 
 #ifdef __cplusplus
 }

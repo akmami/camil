@@ -243,9 +243,6 @@ static enum camil_command opt_command(const char *word) {
 
 void camil_usage(FILE *out) {
 	fprintf(out,
-	        CAMIL_NAME " (" CAMIL_VERSION
-	        "): read classification with locally consistent parsing cores\n"
-	        "\n"
 	        "usage: ./" CAMIL_NAME " <command> [options]\n"
 	        "\n"
 	        "commands:\n"
@@ -311,7 +308,7 @@ void camil_usage_command(FILE *out, enum camil_command command) {
 		        "\n"
 		        "A genome is reported under the short name written after a comma, or under\n"
 		        "its file name with the directory and extension removed when no name is\n"
-		        "given. '-g /data/refs/GRCh38.fa.gz,human' is reported as 'human'.\n"
+		        "given. '-g /data/refs/GRCh38.fa.gz,Human' is reported as 'Human'.\n"
 		        "\n"
 		        "options:\n"
 		        "  -g, --genome FILE[,NAME]  reference genome, repeat once per genome\n"

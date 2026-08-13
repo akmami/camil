@@ -14,7 +14,7 @@ extern "C" {
 #include <stdio.h>
 
 // occupancy the table is sized for when it is frozen
-#define CTABLE_TARGET_LOAD 0.55
+#define CTABLE_TARGET_LOAD 0.75
 
 // how many labels ahead the classification loop prefetches
 #define CTABLE_PREFETCH_DISTANCE 8

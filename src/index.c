@@ -641,4 +641,19 @@ void camil_index_report(const struct camil_index *index) {
 		log_info("  genome %u: %s", i, index->names[i]);
 	}
 	log_info("index: %llu cores, about %llu MiB in memory", (unsigned long long)ctable_size(&index->table), (unsigned long long)(ctable_memory(&index->table) / (1024ull * 1024ull)));
+
+	camil_index_warn_collisions(index);
+}
+
+// warns when the index fills enough of the label space for chance matches to distort the result.
+void camil_index_warn_collisions(const struct camil_index *index) {
+	double space = ldexp(1.0, (int)(sizeof(lcp_label) * 8));
+	double occupancy = (double)ctable_size(&index->table) / space;
+
+	if (occupancy < CAMIL_COLLISION_WARN) {
+		return;
+	}
+
+	log_warn("the index fills %.1f%% of the %u bit label space, so roughly %.1f%% of read cores will match by chance", 100.0 * occupancy, (unsigned)(sizeof(lcp_label) * 8), 100.0 * occupancy);
+	log_warn("a read with %d cores then carries a spurious hit %.0f%% of the time; consider --min-ratio below 1.0 and --min-hits above 1", CAMIL_COLLISION_READ_CORES, 100.0 * (1.0 - pow(1.0 - occupancy, CAMIL_COLLISION_READ_CORES)));
 }
