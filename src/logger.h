@@ -1,6 +1,7 @@
 #ifndef CAMIL_LOGGER_H
 #define CAMIL_LOGGER_H
 
+#define _POSIX_C_SOURCE 200809L // this is must to prevent a bug
 
 #ifdef __cplusplus
 extern "C" {
