@@ -11,6 +11,8 @@ extern "C" {
 #include "encoding.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 
 #define CAMIL_NAME    "camil"
@@ -58,6 +60,21 @@ enum camil_status {
 
 // human readable form of enum camil_status, never NULL
 const char *camil_status_name(int status);
+
+// duplicates a NUL terminated string, NULL when out of memory.
+//
+// strdup is POSIX rather than ISO C, so a strict -std=cNN hides it and the
+// call silently becomes an implicit int, truncating the pointer. Carrying our
+// own keeps the build independent of feature test macros and include order.
+static inline char *camil_strdup(const char *text) {
+	size_t size = strlen(text) + 1;
+	char *copy = (char *)malloc(size);
+
+	if (copy != NULL) {
+		memcpy(copy, text, size);
+	}
+	return copy;
+}
 
 // mixes a core label into a 64 bit hash
 static inline uint64_t camil_hash(lcp_label label) {

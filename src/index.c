@@ -317,7 +317,7 @@ static int index_resolve_names(struct camil_index *index, const struct camil_gen
 		char *candidate;
 		int owner;
 
-		candidate = genomes[i].name != NULL ? strdup(genomes[i].name) : seq_basename(genomes[i].path);
+		candidate = genomes[i].name != NULL ? camil_strdup(genomes[i].name) : seq_basename(genomes[i].path);
 		if (candidate == NULL) {
 			log_error("out of memory while allocating genome names");
 			return -1;
@@ -352,7 +352,7 @@ static int index_resolve_names(struct camil_index *index, const struct camil_gen
 			}
 			log_warn("the name '%s' is already used by %s, %s is reported as '%s'", candidate, genomes[owner].path, genomes[i].path, numbered);
 			free(candidate);
-			candidate = strdup(numbered);
+			candidate = camil_strdup(numbered);
 			if (candidate == NULL) {
 				log_error("out of memory while allocating genome names");
 				return -1;

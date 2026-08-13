@@ -6,6 +6,7 @@
 extern "C" {
 #endif
 
+#include "camil.h"
 #include "logger.h"
 #include "kseq.h" // from deps
 #include <stdio.h>

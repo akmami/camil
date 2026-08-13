@@ -13,12 +13,12 @@ static double log_start = -1.0;
 // returns the current time in seconds
 static double log_now(void) {
 	struct timespec ts;
-#if defined(CLOCK_MONOTONIC)
+#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 199309L
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
 		return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 	}
 #endif
-	if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+	if (timespec_get(&ts, TIME_UTC) == TIME_UTC) {
 		return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 	}
 	return 0.0;

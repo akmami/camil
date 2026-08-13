@@ -36,7 +36,7 @@ struct seqfile *seq_open(const char *path) {
 		return NULL;
 	}
 
-	file->path = strdup(path);
+	file->path = camil_strdup(path);
 	return file;
 }
 
@@ -118,7 +118,7 @@ char *seq_basename(const char *path) {
 	// never return an empty name; fall back to the untouched basename
 	if (name[0] == '\0') {
 		free(name);
-		return strdup(begin);
+		return camil_strdup(begin);
 	}
 
 	return name;
