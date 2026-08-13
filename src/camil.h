@@ -27,6 +27,15 @@ typedef uint8_t camil_gid;
 // sentinel stored in ngenomes while indexing, marking a core that turned up in more than CAMIL_MAX_SHARE genomes
 #define CAMIL_OVERFLOW 255u
 
+// longest genome label a report can carry, terminator included
+#define CAMIL_NAME_MAX 256
+
+// one reference genome as it was requested on the command line
+struct camil_genome {
+	char *path;
+	char *name;
+};
+
 // one core of the index
 struct camil_entry {
 	lcp_label label;                 // LCP core label, the key

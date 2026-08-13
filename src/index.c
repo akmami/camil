@@ -285,10 +285,85 @@ static int index_add_genome(struct index_builder *builder, const char *path, cam
 	pthread_mutex_unlock(&builder->stats_mutex);
 
 	if (status == 0) {
-		log_info("indexed %s: %llu sequences, %llu bases, %llu cores", path, (unsigned long long)builder->nseq, (unsigned long long)builder->nbases, (unsigned long long)builder->ncores);
+		log_info("indexed %s (%s): %llu sequences, %llu bases, %llu cores", builder->index->names[gid], path, (unsigned long long)builder->nseq, (unsigned long long)builder->nbases, (unsigned long long)builder->ncores);
 	}
 
 	return status;
+}
+
+// index of the genome already reported under name, or -1 when it is free
+static int name_owner(char *const *names, uint32_t count, const char *name) {
+	uint32_t i;
+
+	for (i = 0; i < count; i++) {
+		if (names[i] != NULL && strcmp(names[i], name) == 0) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+// picks the label each genome is reported under. its short name when one was given, otherwise the file name with the directory and extension removed.
+static int index_resolve_names(struct camil_index *index, const struct camil_genome *genomes) {
+	uint32_t i;
+
+	index->names = (char **)calloc(index->ngenomes, sizeof(char *));
+	if (index->names == NULL) {
+		log_error("out of memory while allocating genome names");
+		return -1;
+	}
+
+	for (i = 0; i < index->ngenomes; i++) {
+		char *candidate;
+		int owner;
+
+		candidate = genomes[i].name != NULL ? strdup(genomes[i].name) : seq_basename(genomes[i].path);
+		if (candidate == NULL) {
+			log_error("out of memory while allocating genome names");
+			return -1;
+		}
+
+		// requested name that is taken gives way to the file name
+		owner = name_owner(index->names, i, candidate);
+		if (owner >= 0 && genomes[i].name != NULL) {
+			char *fallback = seq_basename(genomes[i].path);
+
+			if (fallback == NULL) {
+				log_error("out of memory while allocating genome names");
+				free(candidate);
+				return -1;
+			}
+			log_warn("the name '%s' is already used by %s, %s falls back to '%s'", candidate, genomes[owner].path, genomes[i].path, fallback);
+			free(candidate);
+			candidate = fallback;
+		}
+
+		// two files can still share a base name, so the last resort is a suffix
+		owner = name_owner(index->names, i, candidate);
+		if (owner >= 0) {
+			char numbered[CAMIL_NAME_MAX];
+			unsigned int suffix;
+
+			for (suffix = 2; suffix <= index->ngenomes + 1; suffix++) {
+				snprintf(numbered, sizeof(numbered), "%.*s.%u", (int)sizeof(numbered) - 12, candidate, suffix);
+				if (name_owner(index->names, i, numbered) < 0) {
+					break;
+				}
+			}
+			log_warn("the name '%s' is already used by %s, %s is reported as '%s'", candidate, genomes[owner].path, genomes[i].path, numbered);
+			free(candidate);
+			candidate = strdup(numbered);
+			if (candidate == NULL) {
+				log_error("out of memory while allocating genome names");
+				return -1;
+			}
+		}
+
+		index->names[i] = candidate;
+		log_info("genome %u: %s (%s)", i, index->names[i], genomes[i].path);
+	}
+
+	return 0;
 }
 
 // releases everything an indexing run allocated apart from the index itself
@@ -300,7 +375,7 @@ static void index_builder_destroy(struct index_builder *builder) {
 	pthread_mutex_destroy(&builder->stats_mutex);
 }
 
-int camil_index_build(struct camil_index *index, char *const *paths, uint32_t ngenomes, int lcp_level, int max_share, int use_rc, int threads) {
+int camil_index_build(struct camil_index *index, const struct camil_genome *genomes, uint32_t ngenomes, int lcp_level, int max_share, int use_rc, int threads) {
 	struct index_builder builder;
 	uint32_t i;
 	uint64_t collected;
@@ -329,18 +404,9 @@ int camil_index_build(struct camil_index *index, char *const *paths, uint32_t ng
 	index->use_rc = use_rc != 0;
 	index->ngenomes = ngenomes;
 
-	index->names = (char **)calloc(ngenomes, sizeof(char *));
-	if (index->names == NULL) {
-		log_error("out of memory while allocating genome names");
+	if (index_resolve_names(index, genomes) != 0) {
+		camil_index_destroy(index);
 		return -1;
-	}
-	for (i = 0; i < ngenomes; i++) {
-		index->names[i] = seq_basename(paths[i]);
-		if (index->names[i] == NULL) {
-			log_error("out of memory while allocating genome names");
-			camil_index_destroy(index);
-			return -1;
-		}
 	}
 
 	memset(&builder, 0, sizeof(builder));
@@ -357,7 +423,7 @@ int camil_index_build(struct camil_index *index, char *const *paths, uint32_t ng
 	}
 
 	for (i = 0; i < ngenomes; i++) {
-		if (index_add_genome(&builder, paths[i], (camil_gid)i) != 0) {
+		if (index_add_genome(&builder, genomes[i].path, (camil_gid)i) != 0) {
 			index_builder_destroy(&builder);
 			camil_index_destroy(index);
 			return -1;

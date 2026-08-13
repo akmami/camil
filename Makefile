@@ -14,8 +14,21 @@ LCP_INC := $(LCP_PREFIX)/include
 LCP_LIB := $(LCP_PREFIX)/lib/liblcptools.a
 KLIB_DIR := deps/klib
 
-CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -Wshadow
-CPPFLAGS += -I$(LCP_INC) -I$(KLIB_DIR) -MMD -MP
+# why not decide like this :)
+MACRO_VAL := $(shell gcc -dM -E -x c /dev/null 2>/dev/null | grep __STDC_VERSION__ | awk '{print $$3}')
+$(shell echo $$MACRO_VAL)
+ifeq ($(MACRO_VAL),202311L)
+    CFLAGS += -std=c23
+else ifeq ($(MACRO_VAL),201710L)
+    CFLAGS += -std=c17
+else ifeq ($(MACRO_VAL),201112L)
+    CFLAGS += -std=c11
+else
+    CFLAGS += -std=c99
+endif
+
+CFLAGS += -Wall -Wextra -Wpedantic -Wshadow
+CPPFLAGS += -I$(LCP_INC) -I$(KLIB_DIR)
 LDLIBS += $(LCP_LIB) -lz -lpthread -lm
 
 ifdef DEBUG

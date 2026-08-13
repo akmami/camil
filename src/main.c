@@ -21,6 +21,19 @@ static int check_inputs(char *const *paths, uint32_t count, const char *kind) {
 	return ok ? 0 : -1;
 }
 
+static int check_genomes(const struct camil_genome *genomes, uint32_t count) {
+	uint32_t i;
+	int ok = 1;
+
+	for (i = 0; i < count; i++) {
+		if (!seq_readable(genomes[i].path)) {
+			log_error("cannot read the genome file %s", genomes[i].path);
+			ok = 0;
+		}
+	}
+	return ok ? 0 : -1;
+}
+
 static FILE *open_output(const char *path, FILE *fallback) {
 	FILE *out;
 
@@ -106,12 +119,11 @@ done:
 static int command_index(const struct camil_opts *opts) {
 	struct camil_index index;
 
-	if (check_inputs(opts->genomes, opts->ngenomes, "genome") != 0) {
+	if (check_genomes(opts->genomes, opts->ngenomes) != 0) {
 		return -1;
 	}
 
-	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level,
-	                      opts->max_share, opts->use_rc, opts->threads) != 0) {
+	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level, opts->max_share, opts->use_rc, opts->threads) != 0) {
 		return -1;
 	}
 
@@ -150,13 +162,11 @@ static int command_run(const struct camil_opts *opts) {
 	struct camil_index index;
 	int status;
 
-	if (check_inputs(opts->genomes, opts->ngenomes, "genome") != 0 ||
-	    check_inputs(opts->reads, opts->nreads, "read") != 0) {
+	if (check_genomes(opts->genomes, opts->ngenomes) != 0 || check_inputs(opts->reads, opts->nreads, "read") != 0) {
 		return -1;
 	}
 
-	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level,
-	                      opts->max_share, opts->use_rc, opts->threads) != 0) {
+	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level, opts->max_share, opts->use_rc, opts->threads) != 0) {
 		return -1;
 	}
 

@@ -1,6 +1,157 @@
 #include "opt.h"
 
 
+// longest line a --genome-list file may contain, newline included
+#define CAMIL_LIST_LINE 8192
+
+// duplicates a byte range as a NUL terminated string
+static char *dup_range(const char *begin, size_t len) {
+	char *copy = (char *)malloc(len + 1);
+
+	if (copy == NULL) {
+		log_error("out of memory while collecting arguments");
+		return NULL;
+	}
+	memcpy(copy, begin, len);
+	copy[len] = '\0';
+	return copy;
+}
+
+// drops trailing blanks from a mutable string
+static void trim_end(char *text) {
+	size_t len = strlen(text);
+
+	while (len > 0 && (text[len - 1] == ' ' || text[len - 1] == '\t')) {
+		text[--len] = '\0';
+	}
+}
+
+// appends a genome, taking ownership of both strings
+static int genome_push(struct camil_opts *opts, char *path, char *name) {
+	struct camil_genome *grown;
+
+	grown = (struct camil_genome *)realloc(opts->genomes, ((size_t)opts->ngenomes + 1) * sizeof(struct camil_genome));
+	if (grown == NULL) {
+		log_error("out of memory while collecting genomes");
+		free(path);
+		free(name);
+		return -1;
+	}
+	opts->genomes = grown;
+	opts->genomes[opts->ngenomes].path = path;
+	opts->genomes[opts->ngenomes].name = name;
+	opts->ngenomes++;
+	return 0;
+}
+
+// accepts "path" or "path,shortname"
+static int genome_add_spec(struct camil_opts *opts, const char *spec) {
+	const char *comma = strrchr(spec, ',');
+	char *path;
+	char *name = NULL;
+
+	if (comma != NULL && comma != spec && comma[1] != '\0') {
+		path = dup_range(spec, (size_t)(comma - spec));
+		name = dup_range(comma + 1, strlen(comma + 1));
+		if (path == NULL || name == NULL) {
+			free(path);
+			free(name);
+			return -1;
+		}
+	} else {
+		path = dup_range(spec, strlen(spec));
+		if (path == NULL) {
+			return -1;
+		}
+	}
+
+	return genome_push(opts, path, name);
+}
+
+// reads a tab separated list of genomes: one path per line, optionally followed by a tab and the short name to report it under
+static int genome_add_list(struct camil_opts *opts, const char *path) {
+	char line[CAMIL_LIST_LINE];
+	FILE *in;
+	unsigned long lineno = 0;
+	uint32_t before = opts->ngenomes;
+
+	in = fopen(path, "r");
+	if (in == NULL) {
+		log_error("cannot read the genome list %s", path);
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), in) != NULL) {
+		char *begin = line;
+		char *tab;
+		char *name = NULL;
+		char *path_copy;
+		char *name_copy = NULL;
+		size_t len = strlen(line);
+
+		lineno++;
+
+		// full buffer with no newline means the line was cut in half, and silently indexing half a path would be worse than stopping
+		if (len + 1 == sizeof(line) && line[len - 1] != '\n') {
+			log_error("%s: line %lu is longer than %d characters", path, lineno, (int)sizeof(line) - 1);
+			fclose(in);
+			return -1;
+		}
+
+		while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+			line[--len] = '\0';
+		}
+		while (*begin == ' ' || *begin == '\t') {
+			begin++;
+		}
+		if (*begin == '\0' || *begin == '#') {
+			continue;
+		}
+
+		tab = strchr(begin, '\t');
+		if (tab != NULL) {
+			*tab = '\0';
+			name = tab + 1;
+			while (*name == ' ' || *name == '\t') {
+				name++;
+			}
+			trim_end(name);
+			if (*name == '\0') {
+				name = NULL;
+			}
+		}
+		trim_end(begin);
+		if (*begin == '\0') {
+			continue;
+		}
+
+		path_copy = dup_range(begin, strlen(begin));
+		if (name != NULL) {
+			name_copy = dup_range(name, strlen(name));
+		}
+		if (path_copy == NULL || (name != NULL && name_copy == NULL)) {
+			free(path_copy);
+			free(name_copy);
+			fclose(in);
+			return -1;
+		}
+		if (genome_push(opts, path_copy, name_copy) != 0) {
+			fclose(in);
+			return -1;
+		}
+	}
+
+	if (ferror(in)) {
+		log_error("failed while reading the genome list %s", path);
+		fclose(in);
+		return -1;
+	}
+	fclose(in);
+
+	log_info("read %u genome(s) from %s", opts->ngenomes - before, path);
+	return 0;
+}
+
 // appends value to a growable vector of argv pointers, returns 0 on success.
 static int vector_push(char ***vector, uint32_t *count, char *value) {
 	char **grown = (char **)realloc(*vector, ((size_t)(*count) + 1) * sizeof(char *));
@@ -109,20 +260,25 @@ void camil_usage_command(FILE *out, enum camil_command command) {
 	switch (command) {
 	case CAMIL_CMD_INDEX:
 		fprintf(out,
-		        "usage: ./" CAMIL_NAME " index -o <index> [options] <genome.fa> [genome.fa ...]\n"
+		        "usage: ./" CAMIL_NAME " index -o <index> [options] <genome.fa[,name]> ...\n"
 		        "\n"
 		        "Parses every reference genome into LCP cores and stores the cores that\n"
-		        "occur in at most --max-share genomes. Genome names are derived from the\n"
-		        "file names.\n"
+		        "occur in at most --max-share genomes.\n"
+		        "\n"
+		        "A genome is reported under the short name written after a comma, or under\n"
+		        "its file name with the directory and extension removed when no name is\n"
+		        "given. '/path/to/GRCh38.fa.gz,human' is reported as 'human'.\n"
 		        "\n"
 		        "options:\n"
-		        "  -o, --output FILE     where to write the index (required)\n"
-		        "  -l, --level INT       LCP level (default %d)\n"
-		        "  -n, --max-share INT   genomes a core may occur in, 1 to %d (default 1)\n"
-		        "  -t, --threads INT     worker threads (default %d)\n"
-		        "      --no-rc           do not index reverse complements\n"
-		        "  -v, --verbose         print debug messages\n"
-		        "  -h, --help            show this message\n",
+		        "  -o, --output FILE         where to write the index (required)\n"
+		        "  -G, --genome-list FILE    read genomes from a tab separated file, one\n"
+		        "                            'path <tab> name' per line, the name optional\n"
+		        "  -l, --level INT           LCP level (default %d)\n"
+		        "  -n, --max-share INT       genomes a core may occur in, 1 to %d (default 1)\n"
+		        "  -t, --threads INT         worker threads (default %d)\n"
+		        "      --no-rc               do not index reverse complements\n"
+		        "  -v, --verbose             print debug messages\n"
+		        "  -h, --help                show this message\n",
 		        CAMIL_DEFAULT_LEVEL, CAMIL_MAX_SHARE, CAMIL_DEFAULT_THREADS);
 		break;
 	case CAMIL_CMD_CLASSIFY:
@@ -134,39 +290,45 @@ void camil_usage_command(FILE *out, enum camil_command command) {
 		        "fail a threshold, are ambiguous.\n"
 		        "\n"
 		        "options:\n"
-		        "  -i, --index FILE      index written by '" CAMIL_NAME " index' (required)\n"
-		        "  -o, --output FILE     per read report, tab separated\n"
-		        "  -s, --summary FILE    summary table (default stdout)\n"
-		        "  -t, --threads INT     worker threads (default %d)\n"
-		        "      --min-hits INT    minimum cores supporting the winner (default 1)\n"
-		        "      --min-ratio FLOAT share of matched cores the winner must hold,\n"
-		        "                        between 0 and 1 (default 1.0)\n"
-		        "  -v, --verbose         print debug messages\n"
-		        "  -h, --help            show this message\n",
+		        "  -i, --index FILE          index written by '" CAMIL_NAME " index' (required)\n"
+		        "  -o, --output FILE         per read report, tab separated\n"
+		        "  -s, --summary FILE        summary table (default stdout)\n"
+		        "  -t, --threads INT         worker threads (default %d)\n"
+		        "      --min-hits INT        minimum cores supporting the winner (default 1)\n"
+		        "      --min-ratio FLOAT     share of matched cores the winner must hold,\n"
+		        "                            between 0 and 1 (default 1.0)\n"
+		        "  -v, --verbose             print debug messages\n"
+		        "  -h, --help                show this message\n",
 		        CAMIL_DEFAULT_THREADS);
 		break;
 	case CAMIL_CMD_RUN:
 		fprintf(out,
-		        "usage: ./" CAMIL_NAME " run -g <genome.fa> [-g ...] [options] <reads.fq> [reads.fq ...]\n"
+		        "usage: ./" CAMIL_NAME " run -g <genome.fa[,name]> [-g ...] [options] <reads.fq> ...\n"
 		        "\n"
 		        "Builds an index in memory and immediately classifies the given reads.\n"
 		        "Equivalent to 'index' followed by 'classify' without writing the index,\n"
 		        "unless --save-index is given.\n"
 		        "\n"
+		        "A genome is reported under the short name written after a comma, or under\n"
+		        "its file name with the directory and extension removed when no name is\n"
+		        "given. '-g /data/refs/GRCh38.fa.gz,human' is reported as 'human'.\n"
+		        "\n"
 		        "options:\n"
-		        "  -g, --genome FILE     reference genome, repeat once per genome (required)\n"
-		        "  -o, --output FILE     per read report, tab separated\n"
-		        "  -s, --summary FILE    summary table (default stdout)\n"
-		        "      --save-index FILE also write the index to this file\n"
-		        "  -l, --level INT       LCP level (default %d)\n"
-		        "  -n, --max-share INT   genomes a core may occur in, 1 to %d (default 1)\n"
-		        "  -t, --threads INT     worker threads (default %d)\n"
-		        "      --no-rc           do not index reverse complements\n"
-		        "      --min-hits INT    minimum cores supporting the winner (default 1)\n"
-		        "      --min-ratio FLOAT share of matched cores the winner must hold,\n"
-		        "                        between 0 and 1 (default 1.0)\n"
-		        "  -v, --verbose         print debug messages\n"
-		        "  -h, --help            show this message\n",
+		        "  -g, --genome FILE[,NAME]  reference genome, repeat once per genome\n"
+		        "  -G, --genome-list FILE    read genomes from a tab separated file, one\n"
+		        "                            'path <tab> name' per line, the name optional\n"
+		        "  -o, --output FILE         per read report, tab separated\n"
+		        "  -s, --summary FILE        summary table (default stdout)\n"
+		        "      --save-index FILE     also write the index to this file\n"
+		        "  -l, --level INT           LCP level (default %d)\n"
+		        "  -n, --max-share INT       genomes a core may occur in, 1 to %d (default 1)\n"
+		        "  -t, --threads INT         worker threads (default %d)\n"
+		        "      --no-rc               do not index reverse complements\n"
+		        "      --min-hits INT        minimum cores supporting the winner (default 1)\n"
+		        "      --min-ratio FLOAT     share of matched cores the winner must hold,\n"
+		        "                            between 0 and 1 (default 1.0)\n"
+		        "  -v, --verbose             print debug messages\n"
+		        "  -h, --help                show this message\n",
 		        CAMIL_DEFAULT_LEVEL, CAMIL_MAX_SHARE, CAMIL_DEFAULT_THREADS);
 		break;
 	default:
@@ -288,7 +450,7 @@ int camil_opts_parse(struct camil_opts *opts, int argc, char **argv) {
 		if (only_positional || arg[0] != '-' || arg[1] == '\0') {
 			// positional: a genome for 'index', a read file otherwise.
 			if (opts->command == CAMIL_CMD_INDEX) {
-				if (vector_push(&opts->genomes, &opts->ngenomes, arg) != 0) {
+				if (genome_add_spec(opts, arg) != 0) {
 					return -1;
 				}
 			} else if (vector_push(&opts->reads, &opts->nreads, arg) != 0) {
@@ -377,10 +539,15 @@ int camil_opts_parse(struct camil_opts *opts, int argc, char **argv) {
 			continue;
 		}
 		if (opt_is(arg, "-g", "--genome")) {
-			if ((value = opt_value(argc, argv, &i, arg)) == NULL) {
+			if ((value = opt_value(argc, argv, &i, arg)) == NULL ||
+			    genome_add_spec(opts, value) != 0) {
 				return -1;
 			}
-			if (vector_push(&opts->genomes, &opts->ngenomes, value) != 0) {
+			continue;
+		}
+		if (opt_is(arg, "-G", "--genome-list")) {
+			if ((value = opt_value(argc, argv, &i, arg)) == NULL ||
+			    genome_add_list(opts, value) != 0) {
 				return -1;
 			}
 			continue;
@@ -412,6 +579,13 @@ int camil_opts_parse(struct camil_opts *opts, int argc, char **argv) {
 }
 
 void camil_opts_free(struct camil_opts *opts) {
+	uint32_t i;
+
+	// genome paths and names are copies, unlike the read files, which point straight into argv
+	for (i = 0; i < opts->ngenomes; i++) {
+		free(opts->genomes[i].path);
+		free(opts->genomes[i].name);
+	}
 	free(opts->genomes);
 	free(opts->reads);
 	opts->genomes = NULL;

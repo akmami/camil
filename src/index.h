@@ -88,7 +88,7 @@ struct camil_index {
 };
 
 // builds an index from ngenomes reference files
-int camil_index_build(struct camil_index *index, char *const *paths, uint32_t ngenomes, int lcp_level, int max_share, int use_rc, int threads);
+int camil_index_build(struct camil_index *index, const struct camil_genome *genomes, uint32_t ngenomes, int lcp_level, int max_share, int use_rc, int threads);
 
 // writes the index to path in the format documented above
 int camil_index_save(const struct camil_index *index, const char *path);

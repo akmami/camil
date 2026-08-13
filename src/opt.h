@@ -43,14 +43,14 @@ struct camil_opts {
 
 	struct camil_thresholds thresholds; // --min-hits, --min-ratio
 
-	const char *index_out;    // index: -o, run: --save-index
-	const char *index_in;     // classify: -i
-	const char *per_read_out; // classify and run: -o
-	const char *summary_out;  // classify and run: -s, stdout when NULL
+	const char *index_out;        // index: -o, run: --save-index
+	const char *index_in;         // classify: -i
+	const char *per_read_out;     // classify and run: -o
+	const char *summary_out;      // classify and run: -s, stdout when NULL
 
-	char **genomes;     // index: positional, run: -g
+	struct camil_genome *genomes; // index: positional, run: -g, either: -G
 	uint32_t ngenomes;
-	char **reads;       // classify and run: positional
+	char **reads;                 // classify and run: positional
 	uint32_t nreads;
 };
 
