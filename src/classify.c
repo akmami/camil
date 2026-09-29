@@ -3,14 +3,17 @@
 
 // outcome for a single read
 struct read_result {
-	uint32_t ncores;   // cores the read decomposed into
-	uint32_t nmatched; // cores found in the index
-	uint16_t best;     // votes for the winning genome, saturating
-	uint16_t second;   // votes for the runner up, saturating
-	int16_t gid;       // winning genome, or -1 when there is none
-	uint8_t status;    // enum camil_status
-	uint8_t reserved;  // keeps the record at 16 bytes
+	uint32_t ncores;      // cores the read decomposed into
+	uint32_t nmatched;    // cores found in the index
+	uint32_t best;        // votes for the winning genome
+	uint32_t second;      // votes for the runner up
+	int64_t gid;          // winning genome, or -1 when there is none
+	uint8_t status;       // enum camil_status
+	uint8_t reserved[7];  // keeps the record at 32 bytes
 };
+
+// fails the build if the record stops dividing a cache line evenly
+typedef char read_result_size_check[sizeof(struct read_result) == 32 ? 1 : -1];
 
 // number of results that share one cache line; chunk sizes are rounded to it
 #define RESULTS_PER_LINE (CAMIL_CACHE_LINE / (int)sizeof(struct read_result))
@@ -214,11 +217,6 @@ static int batch_push(struct read_batch *batch, const struct seqrec *rec) {
 	return 0;
 }
 
-// clamps a vote count to what the report record can hold
-static uint16_t saturate16(uint32_t value) {
-	return value > 0xFFFFu ? 0xFFFFu : (uint16_t)value;
-}
-
 // makes sure a job's key buffer holds at least n keys
 static int job_reserve(struct classify_job *job, int n) {
 	uint64_t *grown;
@@ -243,7 +241,7 @@ static void classify_read(struct classify_job *job, const char *seq, uint32_t le
 	uint32_t nmatched = 0;
 	uint32_t best = 0;
 	uint32_t second = 0;
-	int32_t best_sid = -1;
+	int64_t best_sid = -1;
 	int tied = 0;
 	int nkeys = 0;
 	int ntouched = 0;
@@ -271,11 +269,7 @@ static void classify_read(struct classify_job *job, const char *seq, uint32_t le
 	// Keys first, lookups second. Reducing every core to its key up front is
 	// what lets the loop below prefetch far ahead of where it is reading.
 	for (i = 0; i < n; i++) {
-		uint64_t key;
-
-		if (camil_core_key(seq, len, &parsed.cores[i], 0, index->margin, &key) == 0) {
-			job->keys[nkeys++] = key;
-		}
+		job->keys[nkeys++] = camil_core_key(&parsed.cores[i]);
 	}
 	free_lps(&parsed);
 
@@ -328,7 +322,7 @@ static void classify_read(struct classify_job *job, const char *seq, uint32_t le
 		if (v > best) {
 			second = best;
 			best = v;
-			best_sid = (int32_t)job->touched[i];
+			best_sid = (int64_t)job->touched[i];
 			tied = 0;
 		} else if (v == best) {
 			tied = 1;
@@ -345,8 +339,8 @@ static void classify_read(struct classify_job *job, const char *seq, uint32_t le
 		return;
 	}
 
-	result->best = saturate16(best);
-	result->second = saturate16(second);
+	result->best = best;
+	result->second = second;
 
 	if (tied || best == 0) {
 		result->status = CAMIL_AMBIGUOUS;
@@ -361,7 +355,7 @@ static void classify_read(struct classify_job *job, const char *seq, uint32_t le
 		return;
 	}
 
-	result->gid = (int16_t)best_sid;
+	result->gid = best_sid;
 	result->status = CAMIL_ASSIGNED;
 }
 

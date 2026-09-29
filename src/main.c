@@ -1,4 +1,5 @@
 #include "camil.h"
+#include "cfull.h"
 #include "classify.h"
 #include "index.h"
 #include "logger.h"
@@ -15,19 +16,6 @@ static int check_inputs(char *const *paths, uint32_t count, const char *kind) {
 	for (i = 0; i < count; i++) {
 		if (!seq_readable(paths[i])) {
 			log_error("cannot read the %s file %s", kind, paths[i]);
-			ok = 0;
-		}
-	}
-	return ok ? 0 : -1;
-}
-
-static int check_genomes(const struct camil_genome *genomes, uint32_t count) {
-	uint32_t i;
-	int ok = 1;
-
-	for (i = 0; i < count; i++) {
-		if (!seq_readable(genomes[i].path)) {
-			log_error("cannot read the genome file %s", genomes[i].path);
 			ok = 0;
 		}
 	}
@@ -115,17 +103,43 @@ done:
 	return status;
 }
 
-// camil index: build an index from the reference genomes and save it
+// camil index: build the full index of the reference genomes and save it
 static int command_index(const struct camil_opts *opts) {
+	struct cfull full;
+
+	// Genomes are not probed up front: with tens of thousands of them that is
+	// a second pass over the file system, and a file that cannot be opened is
+	// reported and skipped when its turn comes.
+	if (camil_full_build(&full, opts->genomes, opts->ngenomes, opts->lcp_level, opts->use_rc, opts->threads) != 0) {
+		return -1;
+	}
+
+	cfull_report(&full);
+
+	if (cfull_save(&full, opts->index_out) != 0) {
+		cfull_destroy(&full);
+		return -1;
+	}
+
+	cfull_destroy(&full);
+	return 0;
+}
+
+// camil subset: load a full index and write a classify index over some of its species
+static int command_subset(const struct camil_opts *opts) {
+	struct cfull full;
 	struct camil_index index;
 
-	if (check_genomes(opts->genomes, opts->ngenomes) != 0) {
+	if (cfull_load(&full, opts->index_in) != 0) {
 		return -1;
 	}
+	cfull_report(&full);
 
-	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level, opts->max_share, opts->use_rc, opts->margin, opts->threads) != 0) {
+	if (cfull_subset(&full, opts->species, opts->nspecies, (uint32_t)opts->max_share, opts->threads, &index) != 0) {
+		cfull_destroy(&full);
 		return -1;
 	}
+	cfull_destroy(&full);
 
 	camil_index_report(&index);
 
@@ -162,11 +176,11 @@ static int command_run(const struct camil_opts *opts) {
 	struct camil_index index;
 	int status;
 
-	if (check_genomes(opts->genomes, opts->ngenomes) != 0 || check_inputs(opts->reads, opts->nreads, "read") != 0) {
+	if (check_inputs(opts->reads, opts->nreads, "read") != 0) {
 		return -1;
 	}
 
-	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level, opts->max_share, opts->use_rc, opts->margin, opts->threads) != 0) {
+	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level, opts->max_share, opts->use_rc, opts->threads) != 0) {
 		return -1;
 	}
 
@@ -197,7 +211,6 @@ int main(int argc, char **argv) {
 	log_info(CAMIL_NAME " " CAMIL_VERSION " starting");
 
 	LCP_INIT();
-	camil_key_init();
 
 	switch (opts.command) {
 	case CAMIL_CMD_INDEX:
@@ -208,6 +221,9 @@ int main(int argc, char **argv) {
 		break;
 	case CAMIL_CMD_RUN:
 		status = command_run(&opts);
+		break;
+	case CAMIL_CMD_SUBSET:
+		status = command_subset(&opts);
 		break;
 	default:
 		camil_usage(stderr);

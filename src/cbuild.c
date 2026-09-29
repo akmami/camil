@@ -127,7 +127,7 @@ void cbuild_free(struct cbuild *builder) {
 	memset(builder, 0, sizeof(*builder));
 }
 
-int cbuild_push(struct cbuild *builder, struct cbuild_sink *sink, uint64_t key, camil_sid sid, uint8_t level) {
+int cbuild_push(struct cbuild *builder, struct cbuild_sink *sink, uint64_t key, camil_sid sid) {
 	uint32_t b = (uint32_t)(key >> (64 - builder->bucket_bits));
 	struct cbuild_bucket *bucket = &sink->buckets[b];
 	struct cbuild_rec *rec;
@@ -153,8 +153,6 @@ int cbuild_push(struct cbuild *builder, struct cbuild_sink *sink, uint64_t key, 
 	rec = &bucket->tail->recs[bucket->tail->n++];
 	rec->key = key;
 	rec->sid = sid;
-	rec->level = level;
-	rec->flags = 0;
 	bucket->count++;
 	return 0;
 }
@@ -279,16 +277,17 @@ static void cbuild_reduce_bucket(void *arg) {
 	reduce->out[job->bucket].recs = recs;
 }
 
-int cbuild_freeze(struct cbuild *builder, uint32_t max_share, int threads, struct ctable *table) {
+// Runs the parallel reduction over every bucket. On success *out holds one
+// reduced, sorted record array per bucket (NULL and 0 for an empty bucket) that
+// the caller must free; the collected chunks are consumed either way.
+static int cbuild_reduce(struct cbuild *builder, uint32_t max_share, int threads, struct cbuild_out **out) {
 	struct cbuild_reduce reduce;
 	struct cbuild_job *jobs;
 	struct tpool pool;
-	uint64_t nentries = 0;
-	uint64_t written = 0;
 	uint32_t b;
-	int status = 0;
+	int status;
 
-	memset(table, 0, sizeof(*table));
+	*out = NULL;
 
 	reduce.builder = builder;
 	reduce.max_share = max_share;
@@ -321,37 +320,126 @@ int cbuild_freeze(struct cbuild *builder, uint32_t max_share, int threads, struc
 	status = builder->failed ? -1 : 0;
 	pthread_mutex_unlock(&builder->lock);
 
-	for (b = 0; b < builder->nbuckets; b++) {
-		nentries += reduce.out[b].n;
-	}
-
-	if (status == 0 && ctable_alloc(table, nentries) != 0) {
-		status = -1;
-	}
-
-	// Buckets are disjoint key ranges reduced in order, so copying them one
-	// after another leaves the whole array sorted.
-	for (b = 0; b < builder->nbuckets; b++) {
-		uint64_t i;
-
-		if (status == 0) {
-			for (i = 0; i < reduce.out[b].n; i++) {
-				table->keys[written] = reduce.out[b].recs[i].key;
-				table->values[written].sid = reduce.out[b].recs[i].sid;
-				table->values[written].level = reduce.out[b].recs[i].level;
-				table->values[written].flags = reduce.out[b].recs[i].flags;
-				written++;
-			}
-		}
-		free(reduce.out[b].recs);
-	}
-	free(reduce.out);
-
 	if (status != 0) {
-		ctable_free(table);
+		for (b = 0; b < builder->nbuckets; b++) {
+			free(reduce.out[b].recs);
+		}
+		free(reduce.out);
 		return -1;
 	}
 
+	*out = reduce.out;
+	return 0;
+}
+
+static void cbuild_out_free(struct cbuild_out *out, uint32_t nbuckets) {
+	uint32_t b;
+
+	if (out == NULL) {
+		return;
+	}
+	for (b = 0; b < nbuckets; b++) {
+		free(out[b].recs);
+	}
+	free(out);
+}
+
+int cbuild_freeze(struct cbuild *builder, uint32_t max_share, int threads, struct ctable *table) {
+	struct cbuild_out *out;
+	uint64_t nentries = 0;
+	uint64_t written = 0;
+	uint32_t b;
+
+	memset(table, 0, sizeof(*table));
+
+	if (cbuild_reduce(builder, max_share, threads, &out) != 0) {
+		return -1;
+	}
+
+	for (b = 0; b < builder->nbuckets; b++) {
+		nentries += out[b].n;
+	}
+
+	if (ctable_alloc(table, nentries) != 0) {
+		cbuild_out_free(out, builder->nbuckets);
+		return -1;
+	}
+
+	// Buckets are disjoint key ranges reduced in order, so copying them one
+	// after another leaves the whole array sorted. Each bucket is released as
+	// soon as it has been copied, so the peak is well below twice the data.
+	for (b = 0; b < builder->nbuckets; b++) {
+		uint64_t i;
+
+		for (i = 0; i < out[b].n; i++) {
+			table->keys[written] = out[b].recs[i].key;
+			table->values[written].sid = out[b].recs[i].sid;
+			written++;
+		}
+		free(out[b].recs);
+		out[b].recs = NULL;
+	}
+	free(out);
+
 	ctable_index(table);
+	return 0;
+}
+
+int cbuild_freeze_full(struct cbuild *builder, int threads, struct cfull *full) {
+	struct cbuild_out *out;
+	uint64_t ncores = 0;
+	uint64_t npairs = 0;
+	uint64_t cursor = 0;
+	uint32_t b;
+
+	if (cbuild_reduce(builder, CBUILD_KEEP_ALL, threads, &out) != 0) {
+		return -1;
+	}
+
+	// One pass to size the map and the species array: a run of equal keys is
+	// one core, and every record in it is one (core, species) pair.
+	for (b = 0; b < builder->nbuckets; b++) {
+		uint64_t i;
+
+		for (i = 0; i < out[b].n; i++) {
+			if (i == 0 || out[b].recs[i].key != out[b].recs[i - 1].key) {
+				ncores++;
+			}
+		}
+		npairs += out[b].n;
+	}
+
+	if (cfull_alloc(full, ncores, npairs) != 0) {
+		cbuild_out_free(out, builder->nbuckets);
+		return -1;
+	}
+
+	// Every core's species ids go to the flat array in one contiguous run,
+	// ascending, and the map points at it. Species within a run come out of
+	// the collapse already sorted.
+	for (b = 0; b < builder->nbuckets; b++) {
+		uint64_t i = 0;
+
+		while (i < out[b].n) {
+			uint64_t key = out[b].recs[i].key;
+			uint64_t begin = cursor;
+			uint64_t j = i;
+
+			while (j < out[b].n && out[b].recs[j].key == key) {
+				full->sids[cursor++] = out[b].recs[j].sid;
+				j++;
+			}
+			if (cfull_put(full, key, begin, (uint32_t)(j - i)) != 0) {
+				cbuild_out_free(out, builder->nbuckets);
+				return -1;
+			}
+			i = j;
+		}
+		free(out[b].recs);
+		out[b].recs = NULL;
+	}
+	free(out);
+
+	full->nsids = cursor;
 	return 0;
 }

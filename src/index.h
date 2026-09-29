@@ -1,20 +1,30 @@
 // ---------------------------------------------------------------------------
-// index.h -- construction, storage and serialization of a camil core index.
+// index.h -- construction, storage and serialization of camil core indexes.
 //
-// An index is the discriminative summary of a set of reference genomes:
+// Two kinds of index come out of the same collection phase:
+//
+//   The full index (struct cfull, see cfull.h) records every core of every
+//   reference with the complete list of species it occurs in. It is built once
+//   over a whole collection and stored; subsets of the species are extracted
+//   from it later without reparsing anything.
+//
+//   The classify index (struct camil_index, below) is what reads are matched
+//   against: a sorted table from core key to species, restricted to the cores
+//   that occur in at most `max_share` species. It is produced either by
+//   extracting a subset from a full index, or directly from genomes by
+//   `camil run`.
 //
 //   1. Collection. Every reference is read sequence by sequence and parsed into
-//      LCP cores at the requested level. Each core is reduced to a 64 bit key,
-//      the lcptools label in the high half and a hash of the core's own bases
-//      in the low half, and recorded against the species it came from. Unless
+//      LCP cores at the requested level. Each core is reduced to its 64 bit
+//      lcptools label and recorded against the species it came from. Unless
 //      reverse complements are disabled each sequence is parsed twice, so that
 //      reads from either strand match.
 //
-//   2. Reduction. Records are sorted, repeats of a core within one species
-//      collapse to a single entry, and cores present in more than `max_share`
-//      species are dropped. With the default of 1 only cores unique to a single
-//      reference survive. Pruning only helps when references share cores, so an
-//      unrelated reference set keeps nearly everything.
+//   2. Reduction. Records are sorted and repeats of a core within one species
+//      collapse to a single entry. For a classify index, cores present in more
+//      than `max_share` species are dropped; with the default of 1 only cores
+//      unique to a single reference survive. For a full index nothing is
+//      dropped.
 //
 // Sequences are parsed in parallel and the reduction is parallel over disjoint
 // key ranges, so neither phase has a lock on its hot path. The amount of
@@ -33,9 +43,8 @@
 //   16      4     LCP level the cores were computed at
 //   20      4     max_share used when reducing
 //   24      4     nonzero when reverse complements were indexed
-//   28      4     margin folded into each key
-//   32      4     number of species
-//   36      -     per species: 4 byte name length, then the name bytes
+//   28      4     number of species
+//   32      -     per species: 4 byte name length, then the name bytes
 //   -       4     directory bits
 //   -       8     number of entries
 //   -       -     directory, then keys, then values
@@ -53,7 +62,7 @@ extern "C" {
 
 #include "camil.h"
 #include "cbuild.h"
-#include "ckey.h"
+#include "cfull.h"
 #include "ctable.h"
 #include "logger.h"
 #include "seqio.h"
@@ -66,7 +75,7 @@ extern "C" {
 
 
 #define CAMIL_INDEX_MAGIC   "CAMILIDX"
-#define CAMIL_INDEX_VERSION 2u
+#define CAMIL_INDEX_VERSION 3u
 
 // upper bound on the number of sequence bases queued for parsing at any one time
 #define CAMIL_INDEX_INFLIGHT_BASES (1024ull * 1024ull * 1024ull)
@@ -84,16 +93,19 @@ struct camil_index {
 	int lcp_level;       // LCP level used for every reference and every read
 	int max_share;       // species a core may occur in and still be kept
 	int use_rc;          // nonzero when reverse complements were indexed
-	uint32_t margin;     // flanking bases folded into every key
 	uint32_t ngenomes;   // number of references
 	char **names;        // display name per species, indexed by species id
 	struct ctable table; // frozen core key -> species, read only
 };
 
-// builds an index from ngenomes reference files. Each genome is reported under
-// its short name when it has one, otherwise under its file name stripped of
-// directory and extension.
-int camil_index_build(struct camil_index *index, const struct camil_genome *genomes, uint32_t ngenomes, int lcp_level, int max_share, int use_rc, uint32_t margin, int threads);
+// builds a classify index from ngenomes reference files. Each genome is
+// reported under its short name when it has one, otherwise under its file name
+// stripped of directory and extension.
+int camil_index_build(struct camil_index *index, const struct camil_genome *genomes, uint32_t ngenomes, int lcp_level, int max_share, int use_rc, int threads);
+
+// builds a full index from ngenomes reference files: every core, every species
+// it occurs in. Names are resolved as for camil_index_build().
+int camil_full_build(struct cfull *full, const struct camil_genome *genomes, uint32_t ngenomes, int lcp_level, int use_rc, int threads);
 
 // writes the index to path in the format documented above
 int camil_index_save(const struct camil_index *index, const char *path);

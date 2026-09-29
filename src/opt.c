@@ -152,6 +152,89 @@ static int genome_add_list(struct camil_opts *opts, const char *path) {
 	return 0;
 }
 
+// appends a species name, taking a copy
+static int species_add(struct camil_opts *opts, const char *name) {
+	char **grown;
+	char *copy;
+
+	copy = dup_range(name, strlen(name));
+	if (copy == NULL) {
+		return -1;
+	}
+	grown = (char **)realloc(opts->species, ((size_t)opts->nspecies + 1) * sizeof(char *));
+	if (grown == NULL) {
+		log_error("out of memory while collecting species names");
+		free(copy);
+		return -1;
+	}
+	opts->species = grown;
+	opts->species[opts->nspecies++] = copy;
+	return 0;
+}
+
+// reads species names from a file, one per line. Blank lines and lines
+// starting with '#' are ignored; only the first tab separated field counts, so
+// a genome list written for --genome-list can be reused when its names are
+// in the first column.
+static int species_add_list(struct camil_opts *opts, const char *path) {
+	char line[CAMIL_LIST_LINE];
+	FILE *in;
+	unsigned long lineno = 0;
+	uint32_t before = opts->nspecies;
+
+	in = fopen(path, "r");
+	if (in == NULL) {
+		log_error("cannot read the species list %s", path);
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), in) != NULL) {
+		char *begin = line;
+		char *tab;
+		size_t len = strlen(line);
+
+		lineno++;
+
+		if (len + 1 == sizeof(line) && line[len - 1] != '\n') {
+			log_error("%s: line %lu is longer than %d characters", path, lineno, (int)sizeof(line) - 1);
+			fclose(in);
+			return -1;
+		}
+
+		while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+			line[--len] = '\0';
+		}
+		while (*begin == ' ' || *begin == '\t') {
+			begin++;
+		}
+		if (*begin == '\0' || *begin == '#') {
+			continue;
+		}
+		tab = strchr(begin, '\t');
+		if (tab != NULL) {
+			*tab = '\0';
+		}
+		trim_end(begin);
+		if (*begin == '\0') {
+			continue;
+		}
+		if (species_add(opts, begin) != 0) {
+			fclose(in);
+			return -1;
+		}
+	}
+
+	if (ferror(in)) {
+		log_error("failed while reading the species list %s", path);
+		fclose(in);
+		return -1;
+	}
+	fclose(in);
+
+	log_info("read %u species name(s) from %s", opts->nspecies - before, path);
+	return 0;
+}
+
 // appends value to a growable vector of argv pointers, returns 0 on success.
 static int vector_push(char ***vector, uint32_t *count, char *value) {
 	char **grown = (char **)realloc(*vector, ((size_t)(*count) + 1) * sizeof(char *));
@@ -231,6 +314,9 @@ static enum camil_command opt_command(const char *word) {
 	if (strcmp(word, "run") == 0) {
 		return CAMIL_CMD_RUN;
 	}
+	if (strcmp(word, "subset") == 0) {
+		return CAMIL_CMD_SUBSET;
+	}
 	if (strcmp(word, "help") == 0 || strcmp(word, "-h") == 0 || strcmp(word, "--help") == 0) {
 		return CAMIL_CMD_HELP;
 	}
@@ -246,9 +332,10 @@ void camil_usage(FILE *out) {
 	        "usage: ./" CAMIL_NAME " <command> [options]\n"
 	        "\n"
 	        "commands:\n"
-	        "  index      build a core index from reference genomes\n"
-	        "  classify   assign reads using a previously built index\n"
-	        "  run        build an index in memory and classify reads in one go\n"
+	        "  index      build the full core index of a set of reference genomes\n"
+	        "  subset     extract a classify index for some of its species\n"
+	        "  classify   assign reads using a classify index\n"
+	        "  run        build a classify index in memory and classify reads in one go\n"
 	        "  help       show this message, or 'help <command>' for details\n"
 	        "  version    print the version and exit\n");
 }
@@ -259,27 +346,48 @@ void camil_usage_command(FILE *out, enum camil_command command) {
 		fprintf(out,
 		        "usage: ./" CAMIL_NAME " index -o <index> [options] <genome.fa[,name]> ...\n"
 		        "\n"
-		        "Parses every reference genome into LCP cores and stores the cores that\n"
-		        "occur in at most --max-share genomes.\n"
+		        "Parses every reference genome into LCP cores and stores every core with\n"
+		        "the complete list of genomes it occurs in. Nothing is filtered: the\n"
+		        "result is the full index that '" CAMIL_NAME " subset' carves classify\n"
+		        "indexes out of, so the references are parsed once for any number of\n"
+		        "subsets.\n"
 		        "\n"
 		        "A genome is reported under the short name written after a comma, or under\n"
 		        "its file name with the directory and extension removed when no name is\n"
 		        "given. '/path/to/GRCh38.fa.gz,human' is reported as 'human'.\n"
 		        "\n"
 		        "options:\n"
-		        "  -o, --output FILE         where to write the index (required)\n"
+		        "  -o, --output FILE         where to write the full index (required)\n"
 		        "  -G, --genome-list FILE    read genomes from a tab separated file, one\n"
 		        "                            'path <tab> name' per line, the name optional\n"
 		        "  -l, --level INT           LCP level (default %d)\n"
-		        "  -n, --max-share INT       species a core may occur in (default 1)\n"
 		        "  -t, --threads INT         worker threads (default %d)\n"
-		        "      --margin INT          flanking bases folded into every core key,\n"
-		        "                            raising specificity at the cost of sensitivity\n"
-		        "                            (default 0)\n"
 		        "      --no-rc               do not index reverse complements\n"
 		        "  -v, --verbose             print debug messages\n"
 		        "  -h, --help                show this message\n",
 		        CAMIL_DEFAULT_LEVEL, CAMIL_DEFAULT_THREADS);
+		break;
+	case CAMIL_CMD_SUBSET:
+		fprintf(out,
+		        "usage: ./" CAMIL_NAME " subset -i <full index> -o <index> [options] <name> ...\n"
+		        "\n"
+		        "Builds a classify index over some of the species of a full index. A core\n"
+		        "is kept when it occurs in at least one of the named species and in at\n"
+		        "most --max-share of them; species that were not named are ignored\n"
+		        "entirely, so a core that is unique among the chosen species is kept even\n"
+		        "when the full index shares it widely. The output numbers the species\n"
+		        "0, 1, ... in the order they were named.\n"
+		        "\n"
+		        "options:\n"
+		        "  -i, --index FILE          full index written by '" CAMIL_NAME " index' (required)\n"
+		        "  -o, --output FILE         where to write the classify index (required)\n"
+		        "  -S, --species-list FILE   read species names from a file, one per line;\n"
+		        "                            only the first tab separated field is used\n"
+		        "  -n, --max-share INT       chosen species a core may occur in (default 1)\n"
+		        "  -t, --threads INT         worker threads (default %d)\n"
+		        "  -v, --verbose             print debug messages\n"
+		        "  -h, --help                show this message\n",
+		        CAMIL_DEFAULT_THREADS);
 		break;
 	case CAMIL_CMD_CLASSIFY:
 		fprintf(out,
@@ -290,7 +398,7 @@ void camil_usage_command(FILE *out, enum camil_command command) {
 		        "fail a threshold, are ambiguous.\n"
 		        "\n"
 		        "options:\n"
-		        "  -i, --index FILE          index written by '" CAMIL_NAME " index' (required)\n"
+		        "  -i, --index FILE          classify index written by '" CAMIL_NAME " subset' (required)\n"
 		        "  -o, --output FILE         per read report, tab separated\n"
 		        "  -s, --summary FILE        summary table (default stdout)\n"
 		        "  -t, --threads INT         worker threads (default %d)\n"
@@ -323,9 +431,6 @@ void camil_usage_command(FILE *out, enum camil_command command) {
 		        "  -l, --level INT           LCP level (default %d)\n"
 		        "  -n, --max-share INT       species a core may occur in (default 1)\n"
 		        "  -t, --threads INT         worker threads (default %d)\n"
-		        "      --margin INT          flanking bases folded into every core key,\n"
-		        "                            raising specificity at the cost of sensitivity\n"
-		        "                            (default 0)\n"
 		        "      --no-rc               do not index reverse complements\n"
 		        "      --min-hits INT        minimum cores supporting the winner (default 1)\n"
 		        "      --min-ratio FLOAT     share of matched cores the winner must hold,\n"
@@ -404,6 +509,20 @@ static int opt_validate(const struct camil_opts *opts) {
 			return -1;
 		}
 		break;
+	case CAMIL_CMD_SUBSET:
+		if (opts->index_in == NULL) {
+			log_error("subset: --index is required");
+			return -1;
+		}
+		if (opts->index_out == NULL) {
+			log_error("subset: --output is required");
+			return -1;
+		}
+		if (opts->nspecies == 0) {
+			log_error("subset: at least one species name is required");
+			return -1;
+		}
+		break;
 	default:
 		break;
 	}
@@ -451,9 +570,13 @@ int camil_opts_parse(struct camil_opts *opts, int argc, char **argv) {
 		double ratio;
 
 		if (only_positional || arg[0] != '-' || arg[1] == '\0') {
-			// positional: a genome for 'index', a read file otherwise.
+			// positional: a genome for 'index', a species name for 'subset', a read file otherwise.
 			if (opts->command == CAMIL_CMD_INDEX) {
 				if (genome_add_spec(opts, arg) != 0) {
+					return -1;
+				}
+			} else if (opts->command == CAMIL_CMD_SUBSET) {
+				if (species_add(opts, arg) != 0) {
 					return -1;
 				}
 			} else if (vector_push(&opts->reads, &opts->nreads, arg) != 0) {
@@ -504,17 +627,6 @@ int camil_opts_parse(struct camil_opts *opts, int argc, char **argv) {
 			opts->threads = (int)number;
 			continue;
 		}
-		if (opt_is(arg, NULL, "--margin")) {
-			if ((value = opt_value(argc, argv, &i, arg)) == NULL || opt_int(value, arg, &number) != 0) {
-				return -1;
-			}
-			if (number < 0) {
-				log_error("--margin cannot be negative");
-				return -1;
-			}
-			opts->margin = (uint32_t)number;
-			continue;
-		}
 		if (opt_is(arg, NULL, "--min-hits")) {
 			if ((value = opt_value(argc, argv, &i, arg)) == NULL ||
 			    opt_int(value, arg, &number) != 0) {
@@ -559,6 +671,13 @@ int camil_opts_parse(struct camil_opts *opts, int argc, char **argv) {
 			}
 			continue;
 		}
+		if (opt_is(arg, "-S", "--species-list")) {
+			if ((value = opt_value(argc, argv, &i, arg)) == NULL ||
+			    species_add_list(opts, value) != 0) {
+				return -1;
+			}
+			continue;
+		}
 		if (opt_is(arg, "-G", "--genome-list")) {
 			if ((value = opt_value(argc, argv, &i, arg)) == NULL ||
 			    genome_add_list(opts, value) != 0) {
@@ -570,9 +689,9 @@ int camil_opts_parse(struct camil_opts *opts, int argc, char **argv) {
 			if ((value = opt_value(argc, argv, &i, arg)) == NULL) {
 				return -1;
 			}
-			// For 'index' the output is the index itself; for the other
-			// commands it is the per read report.
-			if (opts->command == CAMIL_CMD_INDEX) {
+			// For 'index' and 'subset' the output is the index itself; for
+			// the other commands it is the per read report.
+			if (opts->command == CAMIL_CMD_INDEX || opts->command == CAMIL_CMD_SUBSET) {
 				opts->index_out = value;
 			} else {
 				opts->per_read_out = value;
@@ -600,10 +719,16 @@ void camil_opts_free(struct camil_opts *opts) {
 		free(opts->genomes[i].path);
 		free(opts->genomes[i].name);
 	}
+	for (i = 0; i < opts->nspecies; i++) {
+		free(opts->species[i]);
+	}
 	free(opts->genomes);
 	free(opts->reads);
+	free(opts->species);
 	opts->genomes = NULL;
 	opts->reads = NULL;
+	opts->species = NULL;
 	opts->ngenomes = 0;
 	opts->nreads = 0;
+	opts->nspecies = 0;
 }

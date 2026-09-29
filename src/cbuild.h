@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include "camil.h"
+#include "cfull.h"
 #include "ctable.h"
 #include "logger.h"
 #include <pthread.h>
@@ -27,8 +28,9 @@ extern "C" {
 // the sharing limit. Buckets are disjoint key ranges, so the sorted buckets
 // concatenated in order are globally sorted: no merge step and no heap.
 //
-// Emission. Surviving counts are prefix summed, which is the one point where
-// threads meet, and each bucket copies itself into the final arrays.
+// Emission. The reduced buckets are copied out either into a classify table
+// (sorted keys plus a directory, see ctable.h) or into a full index (a hash
+// table from key to a run in a flat species array, see cfull.h).
 //
 // The sort is a radix sort. A comparison sort over a few hundred million
 // records through a function pointer costs minutes, and the keys are fixed
@@ -44,8 +46,8 @@ extern "C" {
 #define CBUILD_MAX_BUCKETS 4096u
 #define CBUILD_BUCKETS_PER_THREAD 8u
 
-// records below this go through insertion sort instead of a radix pass
-#define CBUILD_SMALL_SORT 48u
+// passing this as max_share keeps every core however many species share it
+#define CBUILD_KEEP_ALL UINT32_MAX
 
 #if defined(__GNUC__) || defined(__clang__)
 #define CAMIL_PACKED __attribute__((__packed__))
@@ -59,8 +61,6 @@ extern "C" {
 struct CAMIL_PACKED cbuild_rec {
 	uint64_t key;
 	camil_sid sid;
-	uint8_t level;
-	uint8_t flags;
 };
 
 struct cbuild_block {
@@ -98,15 +98,21 @@ void cbuild_free(struct cbuild *builder);
 
 // Appends one core occurrence to a sink. Thread safe as long as each thread
 // passes a sink of its own. Returns 0 on success, -1 when out of memory.
-int cbuild_push(struct cbuild *builder, struct cbuild_sink *sink, uint64_t key, camil_sid sid, uint8_t level);
+int cbuild_push(struct cbuild *builder, struct cbuild_sink *sink, uint64_t key, camil_sid sid);
 
 // Total occurrences collected so far, repeats included.
 uint64_t cbuild_count(const struct cbuild *builder);
 
 // Sorts, collapses repeats, drops cores shared by more than `max_share`
-// species, and builds the final table. `threads` bucket reducers run in
-// parallel. Returns 0 on success, -1 on failure.
+// species, and builds a classify table. `threads` bucket reducers run in
+// parallel. Consumes the collected chunks. Returns 0 on success, -1 on failure.
 int cbuild_freeze(struct cbuild *builder, uint32_t max_share, int threads, struct ctable *table);
+
+// Sorts, collapses repeats and fills the map and species array of a full
+// index with every core, however many species share it. `full` must already
+// carry its header fields (level, names); this allocates and fills its map
+// and its species array. Consumes the collected chunks. Returns 0 on success.
+int cbuild_freeze_full(struct cbuild *builder, int threads, struct cfull *full);
 
 #ifdef __cplusplus
 }

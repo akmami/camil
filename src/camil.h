@@ -18,12 +18,12 @@ extern "C" {
 #define CAMIL_NAME    "camil"
 #define CAMIL_VERSION "1.0.0"
 
-// species identifiers. Widening this to uint32_t is a one line change plus a
-// bump of the index format version; nothing packs it into a fixed array.
-typedef uint16_t camil_sid;
+// species identifiers. The full index packs a species count into 24 bits next
+// to a 40 bit offset, which is what caps the number of genomes per index.
+typedef uint32_t camil_sid;
 
-#define CAMIL_MAX_GENOMES 65534u
-#define CAMIL_SID_NONE    ((camil_sid)0xFFFFu)
+#define CAMIL_MAX_GENOMES ((1u << 24) - 2u)
+#define CAMIL_SID_NONE    ((camil_sid)0xFFFFFFFFu)
 
 // a core may be shared by any number of species and still be kept; the limit is
 // a run length now rather than the width of a field
@@ -38,17 +38,32 @@ struct camil_genome {
 	char *name;
 };
 
-// what the index stores against a core key. Four bytes, held in an array
-// parallel to the keys so that a lookup that misses never touches it.
+// what a classify index stores against a core key. Four bytes, held in an
+// array parallel to the keys so that a lookup that misses never touches it.
 struct camil_value {
 	camil_sid sid; // species the core was seen in
-	uint8_t level; // LCP level the core was parsed at, for later multi-level use
-	uint8_t flags; // reserved
 };
 
 // fails the build if the value record grows, which would silently undo the
 // layout the lookup path relies on
 typedef char camil_value_size_check[sizeof(struct camil_value) == 4 ? 1 : -1];
+
+// The 64 bit key a core is stored and looked up under is the label lcptools
+// computes for it: the packed bases at level 1, and above that a 64 bit hash
+// over the labels of the cores it was compressed from. lcptools has to be
+// built with LABEL=64 for that to be a 64 bit value; the Makefile pins it,
+// and this check makes a mismatched build fail to compile rather than run
+// with 32 bit keys zero extended.
+#if LCP_LABEL_BITS != 64
+#error "camil needs lcptools built with LABEL=64 (see LCP_VARIANT in the Makefile)"
+#endif
+#if LCP_POS_BITS == 0
+#error "camil needs lcptools built with POS=32 or POS=64"
+#endif
+
+static inline uint64_t camil_core_key(const struct core *cr) {
+	return (uint64_t)cr->label;
+}
 
 // cache line size assumed when padding per thread scratch space. Being wrong here costs a little memory, never correctness.
 #define CAMIL_CACHE_LINE 64
@@ -76,16 +91,6 @@ static inline char *camil_strdup(const char *text) {
 		memcpy(copy, text, size);
 	}
 	return copy;
-}
-
-// finalizer used to mix a 64 bit accumulator, the splitmix64 tail
-static inline uint64_t camil_mix64(uint64_t x) {
-	x ^= x >> 33;
-	x *= 0xFF51AFD7ED558CCDULL;
-	x ^= x >> 33;
-	x *= 0xC4CEB9FE1A85EC53ULL;
-	x ^= x >> 33;
-	return x;
 }
 
 #ifdef __cplusplus
