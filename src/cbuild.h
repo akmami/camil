@@ -1,7 +1,6 @@
 #ifndef CAMIL_CBUILD_H
 #define CAMIL_CBUILD_H
 
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -9,69 +8,105 @@ extern "C" {
 #include "camil.h"
 #include "ctable.h"
 #include "logger.h"
-#include <stdlib.h>
-#include <string.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 
-// occupancy a shard is allowed to reach before it doubles
-#define CBUILD_LOAD_FACTOR 0.70
+// Index construction, arranged so that no two threads ever touch the same
+// memory until the very last prefix sum.
+//
+// Collection. A worker parsing a sequence appends one record per core to its
+// own sink. Each sink keeps a separate chunk list per bucket, where the bucket
+// is the top bits of the key, so appending is a pointer bump with no lock, no
+// atomic and no shared cache line.
+//
+// Reduction. A bucket is then owned by exactly one thread, which gathers that
+// bucket's chunks from every sink, sorts them, collapses repeats and applies
+// the sharing limit. Buckets are disjoint key ranges, so the sorted buckets
+// concatenated in order are globally sorted: no merge step and no heap.
+//
+// Emission. Surviving counts are prefix summed, which is the one point where
+// threads meet, and each bucket copies itself into the final arrays.
+//
+// The sort is a radix sort. A comparison sort over a few hundred million
+// records through a function pointer costs minutes, and the keys are fixed
+// width, so there is nothing to gain by comparing.
 
-// shards allocated per worker thread, and the range the result is clamped to
-#define CBUILD_SHARDS_PER_THREAD 32u
-#define CBUILD_MIN_SHARDS 32u
-#define CBUILD_MAX_SHARDS 4096u
+// bytes per chunk. Small enough that the slack across buckets and threads
+// stays in the tens of megabytes, large enough that allocation is rare.
+#define CBUILD_BLOCK_BYTES 32768u
 
-#define CBUILD_MIN_CAPACITY 16u
+// bounds on the bucket count, which is also the unit of parallelism in the
+// reduction, so it wants to be several times the thread count
+#define CBUILD_MIN_BUCKETS 256u
+#define CBUILD_MAX_BUCKETS 4096u
+#define CBUILD_BUCKETS_PER_THREAD 8u
 
-// one independently locked partition
-struct cbuild_shard {
-	struct camil_entry *entries;
-	uint64_t capacity; // power of two
-	uint64_t size;     // occupied slots
-	uint64_t limit;    // grow when size reaches this
-	pthread_mutex_t mutex;
-	char padding[CAMIL_CACHE_LINE];
+// records below this go through insertion sort instead of a radix pass
+#define CBUILD_SMALL_SORT 48u
+
+#if defined(__GNUC__) || defined(__clang__)
+#define CAMIL_PACKED __attribute__((__packed__))
+#else
+#define CAMIL_PACKED
+#endif
+
+// One core occurrence. Packed to twelve bytes rather than padded to sixteen,
+// which is a quarter of the peak build memory; x86 and ARM both load the
+// unaligned key without penalty worth measuring.
+struct CAMIL_PACKED cbuild_rec {
+	uint64_t key;
+	camil_sid sid;
+	uint8_t level;
+	uint8_t flags;
+};
+
+struct cbuild_block {
+	struct cbuild_block *next;
+	uint32_t n;
+	struct cbuild_rec recs[1]; // CBUILD_BLOCK_RECS of them, sized at allocation
+};
+
+// a bucket's chunk list inside one sink
+struct cbuild_bucket {
+	struct cbuild_block *head;
+	struct cbuild_block *tail;
+	uint64_t count;
+};
+
+// per thread collection point, handed out one at a time to running jobs
+struct cbuild_sink {
+	struct cbuild_bucket *buckets;
 };
 
 struct cbuild {
-	struct cbuild_shard *shards;
-	uint32_t nshards;    // power of two
-	uint32_t shard_mask; // nshards - 1
+	struct cbuild_sink *sinks;
+	int nsinks;
+	uint32_t nbuckets;    // power of two
+	uint32_t bucket_bits;
+	int failed;           // set when a sink could not allocate
+	pthread_mutex_t lock; // guards `failed` only
 };
 
-// per thread scratch used by cbuild_insert_cores()
-struct cbuild_scratch {
-	lcp_label *labels; // labels grouped by shard
-	size_t capacity;   // labels the buffer can hold
-	uint32_t *counts;  // per shard label count
-	uint32_t *offsets; // per shard write cursor
-	uint32_t nshards;
-};
+// Creates the sinks, one per worker. Returns 0 on success, -1 otherwise.
+int cbuild_init(struct cbuild *builder, int threads);
 
-// creates a builder with a shard count derived from threads and room for capacity_hint entries before the first rehash
-int cbuild_init(struct cbuild *builder, int threads, uint64_t capacity_hint);
-
-// releases every shard
+// Releases every chunk still held.
 void cbuild_free(struct cbuild *builder);
 
-// prepares scratch space for one worker thread. Returns 0 on success
-int cbuild_scratch_init(struct cbuild_scratch *scratch, const struct cbuild *builder);
+// Appends one core occurrence to a sink. Thread safe as long as each thread
+// passes a sink of its own. Returns 0 on success, -1 when out of memory.
+int cbuild_push(struct cbuild *builder, struct cbuild_sink *sink, uint64_t key, camil_sid sid, uint8_t level);
 
-// releases the scratch space
-void cbuild_scratch_free(struct cbuild_scratch *scratch);
+// Total occurrences collected so far, repeats included.
+uint64_t cbuild_count(const struct cbuild *builder);
 
-// records that every core in cores occurs in genome gid
-// thread safe with respect to other threads calling it, provided each passes its own scratch
-int cbuild_insert_cores(struct cbuild *builder, struct cbuild_scratch *scratch, const struct core *cores, int ncores, camil_gid gid);
-
-// total number of entries currently held, overflowed ones included
-uint64_t cbuild_size(const struct cbuild *builder);
-
-// builds the immutable table: every entry that belongs to between 1 and max_share genomes is copied into table, the rest are dropped
-// builder is left untouched and should be freed by the caller afterwards
-int cbuild_freeze(const struct cbuild *builder, int max_share, struct ctable *table);
+// Sorts, collapses repeats, drops cores shared by more than `max_share`
+// species, and builds the final table. `threads` bucket reducers run in
+// parallel. Returns 0 on success, -1 on failure.
+int cbuild_freeze(struct cbuild *builder, uint32_t max_share, int threads, struct ctable *table);
 
 #ifdef __cplusplus
 }

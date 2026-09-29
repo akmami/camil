@@ -32,14 +32,45 @@ struct read_batch {
 	size_t seq_capacity;
 };
 
-// one chunk of a batch handed to a worker
+// One chunk of a batch handed to a worker, together with the scratch it needs.
+// Every buffer here belongs to one job and is reused across batches, so a
+// worker writes nothing another worker can see and the inner loop allocates
+// nothing.
 struct classify_job {
 	const struct camil_index *index;
 	const struct camil_thresholds *thresholds;
 	struct read_batch *batch;
-	uint32_t begin; // first read of the chunk
-	uint32_t end;   // one past the last read of the chunk
+	uint32_t begin;       // first read of the chunk
+	uint32_t end;         // one past the last read of the chunk
+	uint64_t *keys;       // keys of the read being scored
+	size_t key_capacity;
+	uint32_t *votes;      // one counter per species, left at zero between reads
+	camil_sid *touched;   // species this read hit, so the reset costs nothing
 };
+
+// Frees the scratch of one job.
+static void classify_job_free(struct classify_job *job) {
+	free(job->keys);
+	free(job->votes);
+	free(job->touched);
+	job->keys = NULL;
+	job->votes = NULL;
+	job->touched = NULL;
+	job->key_capacity = 0;
+}
+
+// Allocates the per species scratch of one job. Returns 0 on success.
+static int classify_job_init(struct classify_job *job, uint32_t ngenomes) {
+	memset(job, 0, sizeof(*job));
+	job->votes = (uint32_t *)calloc(ngenomes > 0 ? ngenomes : 1, sizeof(uint32_t));
+	job->touched = (camil_sid *)malloc((ngenomes > 0 ? ngenomes : 1) * sizeof(camil_sid));
+	if (job->votes == NULL || job->touched == NULL) {
+		log_error("out of memory while preparing the classification workers");
+		classify_job_free(job);
+		return -1;
+	}
+	return 0;
+}
 
 void camil_thresholds_default(struct camil_thresholds *thresholds) {
 	thresholds->min_hits = 1;
@@ -188,18 +219,36 @@ static uint16_t saturate16(uint32_t value) {
 	return value > 0xFFFFu ? 0xFFFFu : (uint16_t)value;
 }
 
+// makes sure a job's key buffer holds at least n keys
+static int job_reserve(struct classify_job *job, int n) {
+	uint64_t *grown;
+
+	if ((size_t)n <= job->key_capacity) {
+		return 0;
+	}
+	grown = (uint64_t *)realloc(job->keys, (size_t)n * sizeof(uint64_t));
+	if (grown == NULL) {
+		return -1;
+	}
+	job->keys = grown;
+	job->key_capacity = (size_t)n;
+	return 0;
+}
+
 // scores one read: parse, look every core up, tally votes, apply thresholds
-static void classify_read(const struct camil_index *index, const struct camil_thresholds *thresholds, const char *seq, uint32_t len, uint32_t *votes, struct read_result *result) {
+static void classify_read(struct classify_job *job, const char *seq, uint32_t len, struct read_result *result) {
+	const struct camil_index *index = job->index;
 	const struct ctable *table = &index->table;
 	struct lps parsed;
 	uint32_t nmatched = 0;
 	uint32_t best = 0;
 	uint32_t second = 0;
-	int32_t best_gid = -1;
+	int32_t best_sid = -1;
 	int tied = 0;
+	int nkeys = 0;
+	int ntouched = 0;
 	int i;
 	int n;
-	uint32_t g;
 
 	memset(result, 0, sizeof(*result));
 	result->gid = -1;
@@ -209,56 +258,91 @@ static void classify_read(const struct camil_index *index, const struct camil_th
 		return;
 	}
 
-	memset(votes, 0, index->ngenomes * sizeof(uint32_t));
-
 	init_lps(&parsed, seq, (int)len);
 	lps_deepen(&parsed, index->lcp_level);
 	n = parsed.size;
-
-	// warm up the pipeline: the first few slots are requested before the first lookup so that the loop below always has a fetch in flight
-	for (i = 0; i < CTABLE_PREFETCH_DISTANCE && i < n; i++) {
-		ctable_prefetch(table, parsed.cores[i].label);
-	}
-
-	for (i = 0; i < n; i++) {
-		const struct camil_entry *entry;
-		uint8_t k;
-
-		if (i + CTABLE_PREFETCH_DISTANCE < n) {
-			ctable_prefetch(table, parsed.cores[i + CTABLE_PREFETCH_DISTANCE].label);
-		}
-
-		entry = ctable_lookup(table, parsed.cores[i].label);
-		if (entry == NULL) {
-			continue;
-		}
-		nmatched++;
-		for (k = 0; k < entry->ngenomes; k++) {
-			votes[entry->gids[k]]++;
-		}
-	}
-
 	result->ncores = n > 0 ? (uint32_t)n : 0;
-	free_lps(&parsed);
 
-	result->nmatched = nmatched;
-	if (nmatched == 0) {
+	if (n <= 0 || job_reserve(job, n) != 0) {
+		free_lps(&parsed);
 		return;
 	}
 
-	// highest and second highest vote count, remembering whether the top is shared by more than one genome
-	for (g = 0; g < index->ngenomes; g++) {
-		if (votes[g] > best) {
+	// Keys first, lookups second. Reducing every core to its key up front is
+	// what lets the loop below prefetch far ahead of where it is reading.
+	for (i = 0; i < n; i++) {
+		uint64_t key;
+
+		if (camil_core_key(seq, len, &parsed.cores[i], 0, index->margin, &key) == 0) {
+			job->keys[nkeys++] = key;
+		}
+	}
+	free_lps(&parsed);
+
+	// A lookup is two dependent misses, the directory then the keys, so the
+	// pipeline runs two stages ahead: the directory entry for a core is
+	// requested well before the keys it points at, which are in turn requested
+	// before the core is scored.
+	for (i = 0; i < CTABLE_PREFETCH_DISTANCE && i < nkeys; i++) {
+		ctable_prefetch_dir(table, ctable_bucket(table, job->keys[i]));
+	}
+	for (i = 0; i < CTABLE_PREFETCH_NEAR && i < nkeys; i++) {
+		ctable_prefetch_keys(table, ctable_bucket(table, job->keys[i]));
+	}
+
+	for (i = 0; i < nkeys; i++) {
+		uint64_t at;
+		uint32_t count = 0;
+		uint32_t k;
+
+		if (i + CTABLE_PREFETCH_DISTANCE < nkeys) {
+			ctable_prefetch_dir(table, ctable_bucket(table, job->keys[i + CTABLE_PREFETCH_DISTANCE]));
+		}
+		if (i + CTABLE_PREFETCH_NEAR < nkeys) {
+			ctable_prefetch_keys(table, ctable_bucket(table, job->keys[i + CTABLE_PREFETCH_NEAR]));
+		}
+
+		at = ctable_find(table, job->keys[i], &count);
+		if (at == CTABLE_NOT_FOUND) {
+			continue;
+		}
+		nmatched++;
+
+		// a core shared by several species is a run of consecutive entries
+		for (k = 0; k < count; k++) {
+			camil_sid sid = table->values[at + k].sid;
+
+			if (job->votes[sid]++ == 0) {
+				job->touched[ntouched++] = sid;
+			}
+		}
+	}
+
+	result->nmatched = nmatched;
+
+	// Only the species this read actually hit are examined, so the scan costs
+	// nothing when an index holds thousands of them.
+	for (i = 0; i < ntouched; i++) {
+		uint32_t v = job->votes[job->touched[i]];
+
+		if (v > best) {
 			second = best;
-			best = votes[g];
-			best_gid = (int32_t)g;
+			best = v;
+			best_sid = (int32_t)job->touched[i];
 			tied = 0;
-		} else if (votes[g] == best && best > 0) {
+		} else if (v == best) {
 			tied = 1;
 			second = best;
-		} else if (votes[g] > second) {
-			second = votes[g];
+		} else if (v > second) {
+			second = v;
 		}
+	}
+	for (i = 0; i < ntouched; i++) {
+		job->votes[job->touched[i]] = 0;
+	}
+
+	if (nmatched == 0) {
+		return;
 	}
 
 	result->best = saturate16(best);
@@ -268,28 +352,26 @@ static void classify_read(const struct camil_index *index, const struct camil_th
 		result->status = CAMIL_AMBIGUOUS;
 		return;
 	}
-	if (best < thresholds->min_hits) {
+	if (best < job->thresholds->min_hits) {
 		result->status = CAMIL_AMBIGUOUS;
 		return;
 	}
-	if ((double)best < thresholds->min_ratio * (double)nmatched) {
+	if ((double)best < job->thresholds->min_ratio * (double)nmatched) {
 		result->status = CAMIL_AMBIGUOUS;
 		return;
 	}
 
-	result->gid = (int16_t)best_gid;
+	result->gid = (int16_t)best_sid;
 	result->status = CAMIL_ASSIGNED;
 }
 
 // thread pool entry point: classify one contiguous chunk of a batch.
 static void classify_job_run(void *arg) {
 	struct classify_job *job = (struct classify_job *)arg;
-	// Thread private vote counters
-	uint32_t votes[CAMIL_MAX_GENOMES];
 	uint32_t i;
 
 	for (i = job->begin; i < job->end; i++) {
-		classify_read(job->index, job->thresholds, job->batch->seqs[i], job->batch->lens[i], votes, &job->batch->results[i]);
+		classify_read(job, job->batch->seqs[i], job->batch->lens[i], &job->batch->results[i]);
 	}
 }
 
@@ -309,7 +391,7 @@ static void batch_report(const struct read_batch *batch, const struct camil_inde
 		const char *assignment = "-";
 
 		if (result->status == CAMIL_ASSIGNED) {
-			assignment = camil_index_genome_name(index, (camil_gid)result->gid);
+			assignment = camil_index_genome_name(index, (camil_sid)result->gid);
 			stats->assigned[result->gid]++;
 		} else if (result->status == CAMIL_AMBIGUOUS) {
 			stats->ambiguous++;
@@ -401,6 +483,13 @@ int camil_classify_file(const struct camil_index *index, const char *path, const
 	if (jobs == NULL) {
 		log_error("out of memory while preparing the classification workers");
 		status = -1;
+	} else {
+		for (i = 0; i < nchunks; i++) {
+			if (classify_job_init(&jobs[i], index->ngenomes) != 0) {
+				status = -1;
+				break;
+			}
+		}
 	}
 
 	if (status == 0 && tpool_init(&pool, threads, (size_t)nchunks) != 0) {
@@ -426,6 +515,11 @@ int camil_classify_file(const struct camil_index *index, const char *path, const
 		tpool_destroy(&pool);
 	}
 
+	if (jobs != NULL) {
+		for (i = 0; i < nchunks; i++) {
+			classify_job_free(&jobs[i]);
+		}
+	}
 	free(jobs);
 	for (i = 0; i < 2; i++) {
 		batch_destroy(&batches[i]);
@@ -442,7 +536,7 @@ void camil_stats_report(const struct camil_stats *stats, const struct camil_inde
 	fprintf(out, "# %s\n", label);
 	fprintf(out, "#category\treads\tpercent\n");
 	for (i = 0; i < stats->ngenomes; i++) {
-		fprintf(out, "%s\t%llu\t%.2f\n", camil_index_genome_name(index, (camil_gid)i), (unsigned long long)stats->assigned[i], 100.0 * (double)stats->assigned[i] / total);
+		fprintf(out, "%s\t%llu\t%.2f\n", camil_index_genome_name(index, (camil_sid)i), (unsigned long long)stats->assigned[i], 100.0 * (double)stats->assigned[i] / total);
 	}
 	fprintf(out, "ambiguous\t%llu\t%.2f\n", (unsigned long long)stats->ambiguous, 100.0 * (double)stats->ambiguous / total);
 	fprintf(out, "unclassified\t%llu\t%.2f\n", (unsigned long long)stats->unclassified, 100.0 * (double)stats->unclassified / total);

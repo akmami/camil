@@ -1,54 +1,47 @@
 // ---------------------------------------------------------------------------
 // index.h -- construction, storage and serialization of a camil core index.
 //
-// An index is the discriminative summary of a set of reference genomes. It is
-// produced in two steps:
+// An index is the discriminative summary of a set of reference genomes:
 //
-//   1. Collection. Every reference is read sequence by sequence and parsed
-//      into LCP cores at the requested level. Each distinct core label is
-//      recorded in the core table together with the genome it came from. A
-//      label seen a thousand times in one genome is stored once; a label seen
-//      in several genomes accumulates several genome ids.
+//   1. Collection. Every reference is read sequence by sequence and parsed into
+//      LCP cores at the requested level. Each core is reduced to a 64 bit key,
+//      the lcptools label in the high half and a hash of the core's own bases
+//      in the low half, and recorded against the species it came from. Unless
+//      reverse complements are disabled each sequence is parsed twice, so that
+//      reads from either strand match.
 //
-//      Unless reverse complement handling is disabled, each reference sequence
-//      is parsed twice, once as given and once as its reverse complement, so
-//      that reads sequenced from either strand can match.
+//   2. Reduction. Records are sorted, repeats of a core within one species
+//      collapse to a single entry, and cores present in more than `max_share`
+//      species are dropped. With the default of 1 only cores unique to a single
+//      reference survive. Pruning only helps when references share cores, so an
+//      unrelated reference set keeps nearly everything.
 //
-//   2. Pruning. Labels present in more than max_share genomes are dropped.
-//      With the default max_share of 1 only labels unique to a single genome
-//      survive, which reproduces the strict behaviour of the original script.
-//      Raising it to 2 or 3 keeps cores shared by a few references, trading
-//      specificity for sensitivity. CAMIL_MAX_SHARE is the hard ceiling.
-//
-// Sequences are parsed in parallel. Because parsing dominates the runtime and
-// the core table is sharded, indexing scales close to linearly with the thread
-// count until input decompression becomes the bottleneck. The amount of
+// Sequences are parsed in parallel and the reduction is parallel over disjoint
+// key ranges, so neither phase has a lock on its hot path. The amount of
 // sequence data held in flight is capped independently of the thread count so
 // that a handful of large chromosomes cannot exhaust memory.
 //
 // On disk format
 // --------------
-// Index files are little endian in practice: values are written with the host
-// byte order, and a magic number plus a version and a type width field let the
-// loader reject files produced by an incompatible build (for instance one
-// compiled with 32 bit core labels reading a 64 bit index).
+// Values are written in host byte order; a magic number, a version and a key
+// width let the loader reject anything an incompatible build produced.
 //
 //   offset  size  content
 //   0       8     magic "CAMILIDX"
 //   8       4     format version
-//   12      4     width of lcp_label in bits (32 or 64)
+//   12      4     key width in bits
 //   16      4     LCP level the cores were computed at
-//   20      4     max_share used when pruning
+//   20      4     max_share used when reducing
 //   24      4     nonzero when reverse complements were indexed
-//   28      4     number of genomes
-//   32      -     per genome: 4 byte name length, then the name bytes
-//   -       8     table capacity in slots
-//   -       8     number of occupied slots
-//   -       -     the slot array, exactly as it sits in memory
+//   28      4     margin folded into each key
+//   32      4     number of species
+//   36      -     per species: 4 byte name length, then the name bytes
+//   -       4     directory bits
+//   -       8     number of entries
+//   -       -     directory, then keys, then values
 //
-// The table is stored raw rather than as a list of entries, which makes
-// loading a single read with no rehashing: an index of a few hundred million
-// cores comes back in the time it takes to stream it off disk.
+// The three arrays are stored exactly as they sit in memory, so loading an
+// index is a read and nothing else.
 // ---------------------------------------------------------------------------
 
 #ifndef CAMIL_INDEX_H
@@ -59,8 +52,9 @@ extern "C" {
 #endif
 
 #include "camil.h"
-#include "ctable.h"
 #include "cbuild.h"
+#include "ckey.h"
+#include "ctable.h"
 #include "logger.h"
 #include "seqio.h"
 #include "tpool.h"
@@ -72,29 +66,34 @@ extern "C" {
 
 
 #define CAMIL_INDEX_MAGIC   "CAMILIDX"
-#define CAMIL_INDEX_VERSION 1u
+#define CAMIL_INDEX_VERSION 2u
 
 // upper bound on the number of sequence bases queued for parsing at any one time
 #define CAMIL_INDEX_INFLIGHT_BASES (1024ull * 1024ull * 1024ull)
 
-// fraction of the label space an index may fill before the chance of accidental core matches is worth reporting
+// fraction of the key space an index may fill before accidental core matches
+// are worth reporting
 #define CAMIL_COLLISION_WARN 0.01
 
-// representative core count per read, used only to turn the per core collision rate into a per read one in the warning
+// representative core count per read, used only to turn the per core collision
+// rate into a per read one in the warning
 #define CAMIL_COLLISION_READ_CORES 20
 
 
 struct camil_index {
 	int lcp_level;       // LCP level used for every reference and every read
-	int max_share;       // genomes a core may occur in and still be kept
+	int max_share;       // species a core may occur in and still be kept
 	int use_rc;          // nonzero when reverse complements were indexed
+	uint32_t margin;     // flanking bases folded into every key
 	uint32_t ngenomes;   // number of references
-	char **names;        // display name per genome, indexed by genome id
-	struct ctable table; // frozen core label -> genome ids, read only
+	char **names;        // display name per species, indexed by species id
+	struct ctable table; // frozen core key -> species, read only
 };
 
-// builds an index from ngenomes reference files
-int camil_index_build(struct camil_index *index, const struct camil_genome *genomes, uint32_t ngenomes, int lcp_level, int max_share, int use_rc, int threads);
+// builds an index from ngenomes reference files. Each genome is reported under
+// its short name when it has one, otherwise under its file name stripped of
+// directory and extension.
+int camil_index_build(struct camil_index *index, const struct camil_genome *genomes, uint32_t ngenomes, int lcp_level, int max_share, int use_rc, uint32_t margin, int threads);
 
 // writes the index to path in the format documented above
 int camil_index_save(const struct camil_index *index, const char *path);
@@ -105,17 +104,17 @@ int camil_index_load(struct camil_index *index, const char *path);
 // releases every resource held by the index
 void camil_index_destroy(struct camil_index *index);
 
-// name of genome gid, or "?" when the id is out of range
-const char *camil_index_genome_name(const struct camil_index *index, camil_gid gid);
+// name of species sid, or "?" when the id is out of range
+const char *camil_index_genome_name(const struct camil_index *index, camil_sid sid);
 
-// number of cores retained after pruning
+// number of cores retained after reduction
 uint64_t camil_index_size(const struct camil_index *index);
 
-// writes a short human readable description of the index to stderr: level, sharing limit, genome names and the number of retained cores
+// writes a short human readable description of the index to stderr
 void camil_index_report(const struct camil_index *index);
 
-// warns when the index fills enough of the label space that chance matches
-// start to matter. Called by camil_index_report()
+// warns when the index fills enough of the key space that chance matches start
+// to matter. Called by camil_index_report()
 void camil_index_warn_collisions(const struct camil_index *index);
 
 #ifdef __cplusplus

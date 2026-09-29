@@ -123,7 +123,7 @@ static int command_index(const struct camil_opts *opts) {
 		return -1;
 	}
 
-	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level, opts->max_share, opts->use_rc, opts->threads) != 0) {
+	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level, opts->max_share, opts->use_rc, opts->margin, opts->threads) != 0) {
 		return -1;
 	}
 
@@ -166,7 +166,7 @@ static int command_run(const struct camil_opts *opts) {
 		return -1;
 	}
 
-	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level, opts->max_share, opts->use_rc, opts->threads) != 0) {
+	if (camil_index_build(&index, opts->genomes, opts->ngenomes, opts->lcp_level, opts->max_share, opts->use_rc, opts->margin, opts->threads) != 0) {
 		return -1;
 	}
 
@@ -197,6 +197,7 @@ int main(int argc, char **argv) {
 	log_info(CAMIL_NAME " " CAMIL_VERSION " starting");
 
 	LCP_INIT();
+	camil_key_init();
 
 	switch (opts.command) {
 	case CAMIL_CMD_INDEX:

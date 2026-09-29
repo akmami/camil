@@ -1,145 +1,175 @@
 #include "ctable.h"
 
 
-// smallest table, so that an empty index is still a valid one to query
-#define CTABLE_MIN_CAPACITY 16u
+// Picks the directory size so that a bucket spans CTABLE_BUCKET_TARGET entries
+// on average. Keys are hash values, so occupancy is even and the average is
+// also close to the typical case.
+static uint32_t ctable_dir_bits(uint64_t nentries) {
+	uint64_t buckets = nentries / CTABLE_BUCKET_TARGET + 1;
+	uint32_t bits = CTABLE_MIN_DIR_BITS;
 
-static uint64_t ctable_next_pow2(uint64_t value) {
-	uint64_t result = CTABLE_MIN_CAPACITY;
-
-	while (result < value) {
-		result <<= 1;
+	while (bits < CTABLE_MAX_DIR_BITS && ((uint64_t)1 << bits) < buckets) {
+		bits++;
 	}
-	return result;
+	return bits;
 }
 
-int ctable_init(struct ctable *table, uint64_t nentries) {
-	uint64_t capacity = ctable_next_pow2((uint64_t)((double)nentries / CTABLE_TARGET_LOAD) + 1);
+int ctable_alloc(struct ctable *table, uint64_t nentries) {
+	uint64_t ndir;
 
 	memset(table, 0, sizeof(*table));
 
-	table->entries = (struct camil_entry *)calloc(capacity, sizeof(struct camil_entry));
-	if (table->entries == NULL) {
-		log_error("core table: out of memory while allocating %llu slots (%llu MiB)", (unsigned long long)capacity, (unsigned long long)(capacity * sizeof(struct camil_entry) / (1024 * 1024)));
+	// Directory offsets are 32 bit, which is what caps an index here. Four
+	// billion cores is far past anything the rest of the tool handles, but the
+	// check keeps the failure explicit rather than silently truncating.
+	if (nentries > UINT32_MAX) {
+		log_error("core table: %llu cores exceeds what one index can address", (unsigned long long)nentries);
 		return -1;
 	}
-	table->capacity = capacity;
-	table->mask = capacity - 1;
-	table->size = 0;
+
+	table->dir_bits = ctable_dir_bits(nentries);
+	ndir = ((uint64_t)1 << table->dir_bits) + 1;
+
+	table->directory = (uint32_t *)calloc(ndir, sizeof(uint32_t));
+	table->keys = (uint64_t *)malloc((nentries > 0 ? nentries : 1) * sizeof(uint64_t));
+	table->values = (struct camil_value *)malloc((nentries > 0 ? nentries : 1) * sizeof(struct camil_value));
+
+	if (table->directory == NULL || table->keys == NULL || table->values == NULL) {
+		log_error("core table: out of memory for %llu cores (%llu MiB)", (unsigned long long)nentries, (unsigned long long)(nentries * 12 / (1024 * 1024)));
+		ctable_free(table);
+		return -1;
+	}
+
+	table->nentries = nentries;
 	return 0;
+}
+
+void ctable_index(struct ctable *table) {
+	uint64_t ndir = ((uint64_t)1 << table->dir_bits) + 1;
+	uint64_t i;
+	uint64_t bucket;
+	uint64_t next = 0;
+
+	// One pass writes, for every bucket, where its run starts. Buckets with no
+	// keys end up equal to their neighbour, which makes their run empty.
+	for (i = 0; i < table->nentries; i++) {
+		bucket = ctable_bucket(table, table->keys[i]);
+		while (next <= bucket) {
+			table->directory[next++] = (uint32_t)i;
+		}
+	}
+	while (next < ndir) {
+		table->directory[next++] = (uint32_t)table->nentries;
+	}
 }
 
 void ctable_free(struct ctable *table) {
-	free(table->entries);
+	free(table->directory);
+	free(table->keys);
+	free(table->values);
 	memset(table, 0, sizeof(*table));
 }
 
-int ctable_insert(struct ctable *table, const struct camil_entry *entry) {
-	uint64_t idx = camil_hash(entry->label) & table->mask;
-
-	if (table->size + 1 >= table->capacity) {
-		log_error("core table: no room left for %llu entries in %llu slots", (unsigned long long)table->size + 1, (unsigned long long)table->capacity);
-		return -1;
-	}
-
-	while (table->entries[idx].ngenomes != 0) {
-		idx = (idx + 1) & table->mask;
-	}
-	table->entries[idx] = *entry;
-	table->size++;
-	return 0;
-}
-
-uint64_t ctable_size(const struct ctable *table) {
-	return table->size;
-}
-
 uint64_t ctable_memory(const struct ctable *table) {
-	return table->capacity * sizeof(struct camil_entry) + sizeof(struct ctable);
+	uint64_t ndir = ((uint64_t)1 << table->dir_bits) + 1;
+
+	return ndir * sizeof(uint32_t) + table->nentries * (sizeof(uint64_t) + sizeof(struct camil_value)) + sizeof(struct ctable);
 }
 
 int ctable_write(const struct ctable *table, FILE *out) {
-	if (fwrite(&table->capacity, sizeof(table->capacity), 1, out) != 1 ||
-	    fwrite(&table->size, sizeof(table->size), 1, out) != 1) {
+	uint64_t ndir = ((uint64_t)1 << table->dir_bits) + 1;
+	uint32_t bits = table->dir_bits;
+
+	if (fwrite(&bits, sizeof(bits), 1, out) != 1 || fwrite(&table->nentries, sizeof(table->nentries), 1, out) != 1) {
 		return -1;
 	}
-	if (table->capacity > 0 &&
-	    fwrite(table->entries, sizeof(struct camil_entry), table->capacity, out) != table->capacity) {
+	if (fwrite(table->directory, sizeof(uint32_t), ndir, out) != ndir) {
 		return -1;
+	}
+	if (table->nentries > 0) {
+		if (fwrite(table->keys, sizeof(uint64_t), table->nentries, out) != table->nentries) {
+			return -1;
+		}
+		if (fwrite(table->values, sizeof(struct camil_value), table->nentries, out) != table->nentries) {
+			return -1;
+		}
 	}
 	return 0;
 }
 
 int ctable_read(struct ctable *table, FILE *in) {
-	uint64_t capacity;
-	uint64_t size;
+	uint32_t bits;
+	uint64_t nentries;
+	uint64_t ndir;
 
 	memset(table, 0, sizeof(*table));
 
-	if (fread(&capacity, sizeof(capacity), 1, in) != 1 ||
-	    fread(&size, sizeof(size), 1, in) != 1) {
+	if (fread(&bits, sizeof(bits), 1, in) != 1 || fread(&nentries, sizeof(nentries), 1, in) != 1) {
 		return -1;
 	}
-
-	// capacity is a power of two by construction
-	if (capacity == 0 || (capacity & (capacity - 1)) != 0 || size >= capacity) {
+	if (bits < CTABLE_MIN_DIR_BITS || bits > CTABLE_MAX_DIR_BITS || nentries > UINT32_MAX) {
 		log_error("core table: the stored table has an invalid shape");
 		return -1;
 	}
 
-	// capacity comes straight from the file
-	if (capacity > SIZE_MAX / sizeof(struct camil_entry)) {
-		log_error("core table: the stored table claims an impossible size");
+	ndir = ((uint64_t)1 << bits) + 1;
+
+	table->directory = (uint32_t *)malloc(ndir * sizeof(uint32_t));
+	table->keys = (uint64_t *)malloc((nentries > 0 ? nentries : 1) * sizeof(uint64_t));
+	table->values = (struct camil_value *)malloc((nentries > 0 ? nentries : 1) * sizeof(struct camil_value));
+	if (table->directory == NULL || table->keys == NULL || table->values == NULL) {
+		log_error("core table: out of memory while loading %llu cores", (unsigned long long)nentries);
+		ctable_free(table);
 		return -1;
 	}
 
-	table->entries = (struct camil_entry *)malloc(capacity * sizeof(struct camil_entry));
-	if (table->entries == NULL) {
-		log_error("core table: out of memory while loading %llu slots", (unsigned long long)capacity);
-		return -1;
-	}
-	if (fread(table->entries, sizeof(struct camil_entry), capacity, in) != capacity) {
-		free(table->entries);
-		memset(table, 0, sizeof(*table));
-		return -1;
-	}
+	table->dir_bits = bits;
+	table->nentries = nentries;
 
-	table->capacity = capacity;
-	table->mask = capacity - 1;
-	table->size = size;
+	if (fread(table->directory, sizeof(uint32_t), ndir, in) != ndir) {
+		ctable_free(table);
+		return -1;
+	}
+	if (nentries > 0) {
+		if (fread(table->keys, sizeof(uint64_t), nentries, in) != nentries || fread(table->values, sizeof(struct camil_value), nentries, in) != nentries) {
+			ctable_free(table);
+			return -1;
+		}
+	}
 	return 0;
 }
 
 int ctable_validate(const struct ctable *table, uint32_t ngenomes) {
-	uint64_t occupied = 0;
+	uint64_t ndir = ((uint64_t)1 << table->dir_bits) + 1;
+	uint32_t bucket;
 	uint64_t i;
 
-	// everything in the slot array arrives unchecked from the file
-	// classification loop indexes a stack array with the genome ids it finds here
-	for (i = 0; i < table->capacity; i++) {
-		const struct camil_entry *entry = &table->entries[i];
-		uint8_t k;
-
-		if (entry->ngenomes == 0) {
-			continue;
-		}
-		if (entry->ngenomes > CAMIL_MAX_SHARE) {
-			log_error("core table: an entry claims %u genomes, the limit is %d", entry->ngenomes, CAMIL_MAX_SHARE);
-			return -1;
-		}
-		for (k = 0; k < entry->ngenomes; k++) {
-			if (entry->gids[k] >= ngenomes) {
-				log_error("core table: an entry refers to genome %u of %u", entry->gids[k], ngenomes);
-				return -1;
-			}
-		}
-		occupied++;
-	}
-
-	if (occupied != table->size) {
-		log_error("core table: %llu slots are occupied but the header says %llu", (unsigned long long)occupied, (unsigned long long)table->size);
+	// Everything below arrives unchecked from a file, and the classification
+	// loop indexes a vote array with the species ids it finds here.
+	if (table->directory[0] != 0 || table->directory[ndir - 1] != table->nentries) {
+		log_error("core table: the directory does not span the entries");
 		return -1;
 	}
-
+	for (i = 1; i < ndir; i++) {
+		if (table->directory[i] < table->directory[i - 1] || table->directory[i] > table->nentries) {
+			log_error("core table: the directory is not monotonic");
+			return -1;
+		}
+	}
+	for (i = 0; i < table->nentries; i++) {
+		if (i > 0 && table->keys[i] < table->keys[i - 1]) {
+			log_error("core table: the keys are not sorted");
+			return -1;
+		}
+		bucket = ctable_bucket(table, table->keys[i]);
+		if (i < table->directory[bucket] || i >= table->directory[bucket + 1]) {
+			log_error("core table: the directory does not agree with the keys");
+			return -1;
+		}
+		if (table->values[i].sid >= ngenomes) {
+			log_error("core table: an entry refers to species %u of %u", table->values[i].sid, ngenomes);
+			return -1;
+		}
+	}
 	return 0;
 }

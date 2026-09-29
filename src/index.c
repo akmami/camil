@@ -1,9 +1,6 @@
 #include "index.h"
 
 
-// number of builder slots preallocated before the first rehash
-#define CAMIL_INDEX_INITIAL_SLOTS (1ull << 20)
-
 // counting semaphore over sequence bases, used to cap how much sequence data is queued for parsing at any moment
 struct index_budget {
 	pthread_mutex_t mutex;
@@ -12,10 +9,11 @@ struct index_budget {
 	uint64_t cap;
 };
 
-// fixed set of scratch buffers handed out one per running job
-struct scratch_pool {
-	struct cbuild_scratch *items;
-	int *available; // stack of free indices
+// hands out one collection sink per running job. Sized to the worker count, so
+// acquiring never actually blocks; the lock only makes handing them out safe.
+struct sink_pool {
+	struct cbuild_sink **items;
+	int *available;
 	int nfree;
 	int count;
 	pthread_mutex_t mutex;
@@ -28,11 +26,12 @@ struct index_builder {
 	struct cbuild table;
 	struct tpool pool;
 	struct index_budget budget;
-	struct scratch_pool scratch;
+	struct sink_pool sinks;
 	pthread_mutex_t stats_mutex; // guards the counters below
 	uint64_t nseq;               // sequences parsed for the current genome
 	uint64_t nbases;             // bases parsed for the current genome
 	uint64_t ncores;             // cores produced for the current genome
+	uint64_t nskipped;           // cores refused because the margin did not fit
 	int failed;                  // set when a worker hits an unrecoverable error
 };
 
@@ -41,7 +40,7 @@ struct index_job {
 	struct index_builder *builder;
 	char *seq;
 	int len;
-	camil_gid gid;
+	camil_sid sid;
 };
 
 static void budget_init(struct index_budget *budget, uint64_t cap) {
@@ -73,7 +72,7 @@ static void budget_release(struct index_budget *budget, uint64_t amount) {
 	pthread_mutex_unlock(&budget->mutex);
 }
 
-static int scratch_pool_init(struct scratch_pool *pool, const struct cbuild *table, int count) {
+static int sink_pool_init(struct sink_pool *pool, struct cbuild *table, int count) {
 	int i;
 
 	memset(pool, 0, sizeof(*pool));
@@ -81,40 +80,29 @@ static int scratch_pool_init(struct scratch_pool *pool, const struct cbuild *tab
 		count = 1;
 	}
 
-	pool->items = (struct cbuild_scratch *)calloc((size_t)count, sizeof(struct cbuild_scratch));
+	pool->items = (struct cbuild_sink **)calloc((size_t)count, sizeof(struct cbuild_sink *));
 	pool->available = (int *)malloc((size_t)count * sizeof(int));
 	if (pool->items == NULL || pool->available == NULL) {
-		log_error("out of memory while allocating worker scratch space");
+		log_error("out of memory while allocating the sink pool");
 		free(pool->items);
 		free(pool->available);
 		memset(pool, 0, sizeof(*pool));
 		return -1;
 	}
 
-	// initialized before the loop below can fail
-	pthread_mutex_init(&pool->mutex, NULL);
-	pthread_cond_init(&pool->cv, NULL);
-
 	for (i = 0; i < count; i++) {
-		if (cbuild_scratch_init(&pool->items[i], table) != 0) {
-			pool->count = i;
-			return -1;
-		}
+		pool->items[i] = &table->sinks[i];
 		pool->available[i] = i;
 	}
 
 	pool->count = count;
 	pool->nfree = count;
+	pthread_mutex_init(&pool->mutex, NULL);
+	pthread_cond_init(&pool->cv, NULL);
 	return 0;
 }
 
-static void scratch_pool_destroy(struct scratch_pool *pool) {
-	int i;
-
-	for (i = 0; i < pool->count; i++) {
-		cbuild_scratch_free(&pool->items[i]);
-	}
-	// the lock exists whenever the arrays do, including after a partially failed setup
+static void sink_pool_destroy(struct sink_pool *pool) {
 	if (pool->items != NULL) {
 		pthread_mutex_destroy(&pool->mutex);
 		pthread_cond_destroy(&pool->cv);
@@ -124,31 +112,31 @@ static void scratch_pool_destroy(struct scratch_pool *pool) {
 	memset(pool, 0, sizeof(*pool));
 }
 
-static struct cbuild_scratch *scratch_acquire(struct scratch_pool *pool, int *slot) {
+static struct cbuild_sink *sink_acquire(struct sink_pool *pool, int *slot) {
 	pthread_mutex_lock(&pool->mutex);
 	while (pool->nfree == 0) {
 		pthread_cond_wait(&pool->cv, &pool->mutex);
 	}
 	*slot = pool->available[--pool->nfree];
 	pthread_mutex_unlock(&pool->mutex);
-	return &pool->items[*slot];
+	return pool->items[*slot];
 }
 
-static void scratch_release(struct scratch_pool *pool, int slot) {
+static void sink_release(struct sink_pool *pool, int slot) {
 	pthread_mutex_lock(&pool->mutex);
 	pool->available[pool->nfree++] = slot;
 	pthread_cond_signal(&pool->cv);
 	pthread_mutex_unlock(&pool->mutex);
 }
 
-// records a failure in a way the reading thread can observe.
+// records a failure in a way the reading thread can observe
 static void index_fail(struct index_builder *builder) {
 	pthread_mutex_lock(&builder->stats_mutex);
 	builder->failed = 1;
 	pthread_mutex_unlock(&builder->stats_mutex);
 }
 
-// reading thread polls this so it stops queueing work once the table can no longer accept it
+// reading thread polls this so it stops queueing work once collection has failed
 static int index_failed(struct index_builder *builder) {
 	int failed;
 
@@ -158,20 +146,33 @@ static int index_failed(struct index_builder *builder) {
 	return failed;
 }
 
-// parses one orientation of a sequence and folds every core label into the builder under gid
-static uint64_t index_parse(struct index_builder *builder, struct cbuild_scratch *scratch, const char *seq, int len, camil_gid gid, int reverse_complement) {
+// parses one orientation of a sequence and records every core under sid
+static uint64_t index_parse(struct index_builder *builder, struct cbuild_sink *sink, const char *seq, int len, camil_sid sid, int rc, uint64_t *skipped) {
+	struct camil_index *index = builder->index;
 	struct lps parsed;
 	uint64_t ncores;
+	int i;
 
-	if (reverse_complement) {
+	if (rc) {
 		init_lps2(&parsed, seq, len);
 	} else {
 		init_lps(&parsed, seq, len);
 	}
-	lps_deepen(&parsed, builder->index->lcp_level);
+	lps_deepen(&parsed, index->lcp_level);
 
-	if (cbuild_insert_cores(&builder->table, scratch, parsed.cores, parsed.size, gid) != 0) {
-		index_fail(builder);
+	for (i = 0; i < parsed.size; i++) {
+		uint64_t key;
+
+		// A core too close to the end of the sequence to carry its margin has
+		// no key comparable with anything else, so it is left out.
+		if (camil_core_key(seq, (uint32_t)len, &parsed.cores[i], rc, index->margin, &key) != 0) {
+			(*skipped)++;
+			continue;
+		}
+		if (cbuild_push(&builder->table, sink, key, sid, (uint8_t)index->lcp_level) != 0) {
+			index_fail(builder);
+			break;
+		}
 	}
 
 	ncores = parsed.size > 0 ? (uint64_t)parsed.size : 0;
@@ -183,19 +184,19 @@ static uint64_t index_parse(struct index_builder *builder, struct cbuild_scratch
 static void index_job_run(void *arg) {
 	struct index_job *job = (struct index_job *)arg;
 	struct index_builder *builder = job->builder;
-	struct cbuild_scratch *scratch;
+	struct cbuild_sink *sink;
 	uint64_t ncores;
+	uint64_t skipped = 0;
 	int slot;
 
-	scratch = scratch_acquire(&builder->scratch, &slot);
+	sink = sink_acquire(&builder->sinks, &slot);
 
-	ncores = index_parse(builder, scratch, job->seq, job->len, job->gid, 0);
-	// skip the second orientation once the table has stopped accepting insertions; there is nothing left for it to do
+	ncores = index_parse(builder, sink, job->seq, job->len, job->sid, 0, &skipped);
 	if (builder->index->use_rc && !index_failed(builder)) {
-		ncores += index_parse(builder, scratch, job->seq, job->len, job->gid, 1);
+		ncores += index_parse(builder, sink, job->seq, job->len, job->sid, 1, &skipped);
 	}
 
-	scratch_release(&builder->scratch, slot);
+	sink_release(&builder->sinks, slot);
 
 	free(job->seq);
 	budget_release(&builder->budget, (uint64_t)job->len);
@@ -204,13 +205,14 @@ static void index_job_run(void *arg) {
 	builder->nseq++;
 	builder->nbases += (uint64_t)job->len;
 	builder->ncores += ncores;
+	builder->nskipped += skipped;
 	pthread_mutex_unlock(&builder->stats_mutex);
 
 	free(job);
 }
 
 // reads one reference file and queues every sequence in it
-static int index_add_genome(struct index_builder *builder, const char *path, camil_gid gid) {
+static int index_add_genome(struct index_builder *builder, const char *path, camil_sid sid) {
 	struct seqfile *file;
 	struct seqrec rec;
 	int ret;
@@ -225,6 +227,7 @@ static int index_add_genome(struct index_builder *builder, const char *path, cam
 	builder->nseq = 0;
 	builder->nbases = 0;
 	builder->ncores = 0;
+	builder->nskipped = 0;
 	pthread_mutex_unlock(&builder->stats_mutex);
 
 	while ((ret = seq_read(file, &rec)) > 0) {
@@ -263,7 +266,7 @@ static int index_add_genome(struct index_builder *builder, const char *path, cam
 		job->builder = builder;
 		job->seq = copy;
 		job->len = (int)rec.len;
-		job->gid = gid;
+		job->sid = sid;
 
 		// throttle the reader so that the queued sequences stay within budget
 		budget_acquire(&builder->budget, rec.len);
@@ -285,7 +288,10 @@ static int index_add_genome(struct index_builder *builder, const char *path, cam
 	pthread_mutex_unlock(&builder->stats_mutex);
 
 	if (status == 0) {
-		log_info("indexed %s (%s): %llu sequences, %llu bases, %llu cores", builder->index->names[gid], path, (unsigned long long)builder->nseq, (unsigned long long)builder->nbases, (unsigned long long)builder->ncores);
+		log_info("indexed %s (%s): %llu sequences, %llu bases, %llu cores", builder->index->names[sid], path, (unsigned long long)builder->nseq, (unsigned long long)builder->nbases, (unsigned long long)builder->ncores);
+		if (builder->nskipped > 0) {
+			log_info("  %llu cores had no room for the margin and were left out", (unsigned long long)builder->nskipped);
+		}
 	}
 
 	return status;
@@ -303,7 +309,13 @@ static int name_owner(char *const *names, uint32_t count, const char *name) {
 	return -1;
 }
 
-// picks the label each genome is reported under. its short name when one was given, otherwise the file name with the directory and extension removed.
+// picks the label each genome is reported under: its short name when one was
+// given, otherwise the file name with the directory and extension removed.
+//
+// Names have to stay unique, or two rows of a summary table would be
+// indistinguishable. The first genome to claim a name keeps it; a later one
+// falls back to its file name, and if that is taken too, to a numbered
+// variant. Every fallback is reported.
 static int index_resolve_names(struct camil_index *index, const struct camil_genome *genomes) {
 	uint32_t i;
 
@@ -323,7 +335,7 @@ static int index_resolve_names(struct camil_index *index, const struct camil_gen
 			return -1;
 		}
 
-		// requested name that is taken gives way to the file name
+		// a requested name that is taken gives way to the file name
 		owner = name_owner(index->names, i, candidate);
 		if (owner >= 0 && genomes[i].name != NULL) {
 			char *fallback = seq_basename(genomes[i].path);
@@ -360,7 +372,7 @@ static int index_resolve_names(struct camil_index *index, const struct camil_gen
 		}
 
 		index->names[i] = candidate;
-		log_info("genome %u: %s (%s)", i, index->names[i], genomes[i].path);
+		log_info("species %u: %s (%s)", i, index->names[i], genomes[i].path);
 	}
 
 	return 0;
@@ -369,13 +381,13 @@ static int index_resolve_names(struct camil_index *index, const struct camil_gen
 // releases everything an indexing run allocated apart from the index itself
 static void index_builder_destroy(struct index_builder *builder) {
 	tpool_destroy(&builder->pool);
-	scratch_pool_destroy(&builder->scratch);
+	sink_pool_destroy(&builder->sinks);
 	cbuild_free(&builder->table);
 	budget_destroy(&builder->budget);
 	pthread_mutex_destroy(&builder->stats_mutex);
 }
 
-int camil_index_build(struct camil_index *index, const struct camil_genome *genomes, uint32_t ngenomes, int lcp_level, int max_share, int use_rc, int threads) {
+int camil_index_build(struct camil_index *index, const struct camil_genome *genomes, uint32_t ngenomes, int lcp_level, int max_share, int use_rc, uint32_t margin, int threads) {
 	struct index_builder builder;
 	uint32_t i;
 	uint64_t collected;
@@ -394,14 +406,15 @@ int camil_index_build(struct camil_index *index, const struct camil_genome *geno
 		log_error("the LCP level must be at least 1");
 		return -1;
 	}
-	if (max_share < 1 || max_share > CAMIL_MAX_SHARE) {
-		log_error("the sharing limit must be between 1 and %d", CAMIL_MAX_SHARE);
+	if (max_share < 1) {
+		log_error("the sharing limit must be at least 1");
 		return -1;
 	}
 
 	index->lcp_level = lcp_level;
 	index->max_share = max_share;
 	index->use_rc = use_rc != 0;
+	index->margin = margin;
 	index->ngenomes = ngenomes;
 
 	if (index_resolve_names(index, genomes) != 0) {
@@ -414,33 +427,31 @@ int camil_index_build(struct camil_index *index, const struct camil_genome *geno
 	pthread_mutex_init(&builder.stats_mutex, NULL);
 	budget_init(&builder.budget, CAMIL_INDEX_INFLIGHT_BASES);
 
-	if (cbuild_init(&builder.table, threads, CAMIL_INDEX_INITIAL_SLOTS) != 0 ||
-	    scratch_pool_init(&builder.scratch, &builder.table, threads) != 0 ||
-	    tpool_init(&builder.pool, threads, (size_t)(threads > 0 ? threads : 1) * 2) != 0) {
+	if (cbuild_init(&builder.table, threads) != 0 || sink_pool_init(&builder.sinks, &builder.table, builder.table.nsinks) != 0 || tpool_init(&builder.pool, threads, (size_t)(threads > 0 ? threads : 1) * 2) != 0) {
 		index_builder_destroy(&builder);
 		camil_index_destroy(index);
 		return -1;
 	}
 
 	for (i = 0; i < ngenomes; i++) {
-		if (index_add_genome(&builder, genomes[i].path, (camil_gid)i) != 0) {
+		if (index_add_genome(&builder, genomes[i].path, (camil_sid)i) != 0) {
 			index_builder_destroy(&builder);
 			camil_index_destroy(index);
 			return -1;
 		}
 	}
 
-	// every reference has been parsed; the mutable structure is no longer needed and is condensed into the layout classification wants
-	collected = cbuild_size(&builder.table);
-	if (cbuild_freeze(&builder.table, max_share, &index->table) != 0) {
+	collected = cbuild_count(&builder.table);
+	log_info("collected %llu core occurrences, reducing", (unsigned long long)collected);
+
+	if (cbuild_freeze(&builder.table, (uint32_t)max_share, threads, &index->table) != 0) {
 		index_builder_destroy(&builder);
 		camil_index_destroy(index);
 		return -1;
 	}
 	index_builder_destroy(&builder);
 
-	log_info("collected %llu distinct cores, %llu remain after dropping cores shared by more than %d genome(s)",
-	         (unsigned long long)collected, (unsigned long long)ctable_size(&index->table), max_share);
+	log_info("%llu occurrences reduced to %llu cores kept in at most %d species", (unsigned long long)collected, (unsigned long long)ctable_size(&index->table), max_share);
 
 	return 0;
 }
@@ -465,8 +476,8 @@ int camil_index_save(const struct camil_index *index, const char *path) {
 		goto write_error;
 	}
 
-	// recorded so that an index built with 64 bit labels is not silently read by a binary compiled with 32 bit labels
-	value = (uint32_t)(sizeof(lcp_label) * 8);
+	// recorded so that an index is never read by a build whose keys differ
+	value = 64;
 	if (fwrite(&value, sizeof(value), 1, out) != 1) {
 		goto write_error;
 	}
@@ -483,6 +494,10 @@ int camil_index_save(const struct camil_index *index, const char *path) {
 	if (fwrite(&value, sizeof(value), 1, out) != 1) {
 		goto write_error;
 	}
+	value = index->margin;
+	if (fwrite(&value, sizeof(value), 1, out) != 1) {
+		goto write_error;
+	}
 	value = index->ngenomes;
 	if (fwrite(&value, sizeof(value), 1, out) != 1) {
 		goto write_error;
@@ -491,8 +506,7 @@ int camil_index_save(const struct camil_index *index, const char *path) {
 	for (i = 0; i < index->ngenomes; i++) {
 		uint32_t len = (uint32_t)strlen(index->names[i]);
 
-		if (fwrite(&len, sizeof(len), 1, out) != 1 ||
-		    fwrite(index->names[i], 1, len, out) != len) {
+		if (fwrite(&len, sizeof(len), 1, out) != 1 || fwrite(index->names[i], 1, len, out) != len) {
 			goto write_error;
 		}
 	}
@@ -519,7 +533,7 @@ int camil_index_load(struct camil_index *index, const char *path) {
 	FILE *in;
 	char magic[8];
 	uint32_t version;
-	uint32_t label_bits;
+	uint32_t key_bits;
 	uint32_t value;
 	uint32_t g;
 
@@ -536,12 +550,11 @@ int camil_index_load(struct camil_index *index, const char *path) {
 		goto read_error;
 	}
 	if (fread(&version, sizeof(version), 1, in) != 1 || version != CAMIL_INDEX_VERSION) {
-		log_error("%s was written by an incompatible version of " CAMIL_NAME, path);
+		log_error("%s was written in format version %u, this build reads version %u; rebuild the index", path, version, CAMIL_INDEX_VERSION);
 		goto read_error;
 	}
-	if (fread(&label_bits, sizeof(label_bits), 1, in) != 1 ||
-	    label_bits != (uint32_t)(sizeof(lcp_label) * 8)) {
-		log_error("%s stores %u bit core labels but this build uses %u bit labels", path, label_bits, (uint32_t)(sizeof(lcp_label) * 8));
+	if (fread(&key_bits, sizeof(key_bits), 1, in) != 1 || key_bits != 64) {
+		log_error("%s stores %u bit keys but this build uses 64 bit keys", path, key_bits);
 		goto read_error;
 	}
 
@@ -550,7 +563,7 @@ int camil_index_load(struct camil_index *index, const char *path) {
 	}
 	index->lcp_level = (int)value;
 
-	if (fread(&value, sizeof(value), 1, in) != 1 || value < 1 || value > CAMIL_MAX_SHARE) {
+	if (fread(&value, sizeof(value), 1, in) != 1 || value < 1) {
 		goto truncated;
 	}
 	index->max_share = (int)value;
@@ -559,6 +572,11 @@ int camil_index_load(struct camil_index *index, const char *path) {
 		goto truncated;
 	}
 	index->use_rc = (int)value;
+
+	if (fread(&value, sizeof(value), 1, in) != 1) {
+		goto truncated;
+	}
+	index->margin = value;
 
 	if (fread(&value, sizeof(value), 1, in) != 1 || value == 0 || value > CAMIL_MAX_GENOMES) {
 		goto truncated;
@@ -622,11 +640,11 @@ void camil_index_destroy(struct camil_index *index) {
 	memset(index, 0, sizeof(*index));
 }
 
-const char *camil_index_genome_name(const struct camil_index *index, camil_gid gid) {
-	if (index->names == NULL || gid >= index->ngenomes) {
+const char *camil_index_genome_name(const struct camil_index *index, camil_sid sid) {
+	if (index->names == NULL || sid >= index->ngenomes) {
 		return "?";
 	}
-	return index->names[gid];
+	return index->names[sid];
 }
 
 uint64_t camil_index_size(const struct camil_index *index) {
@@ -636,24 +654,29 @@ uint64_t camil_index_size(const struct camil_index *index) {
 void camil_index_report(const struct camil_index *index) {
 	uint32_t i;
 
-	log_info("index: LCP level %d, sharing limit %d, reverse complement %s", index->lcp_level, index->max_share, index->use_rc ? "on" : "off");
+	log_info("index: LCP level %d, sharing limit %d, margin %u, reverse complement %s", index->lcp_level, index->max_share, index->margin, index->use_rc ? "on" : "off");
 	for (i = 0; i < index->ngenomes; i++) {
-		log_info("  genome %u: %s", i, index->names[i]);
+		log_info("  species %u: %s", i, index->names[i]);
 	}
 	log_info("index: %llu cores, about %llu MiB in memory", (unsigned long long)ctable_size(&index->table), (unsigned long long)(ctable_memory(&index->table) / (1024ull * 1024ull)));
 
 	camil_index_warn_collisions(index);
 }
 
-// warns when the index fills enough of the label space for chance matches to distort the result.
+// warns when the index fills enough of the key space for chance matches to
+// distort the result.
+//
+// With 64 bit keys this is effectively unreachable: even a billion cores fill
+// five parts in a hundred million of the space. It stays as a guard for
+// whoever narrows the key later.
 void camil_index_warn_collisions(const struct camil_index *index) {
-	double space = ldexp(1.0, (int)(sizeof(lcp_label) * 8));
+	double space = ldexp(1.0, 64);
 	double occupancy = (double)ctable_size(&index->table) / space;
 
 	if (occupancy < CAMIL_COLLISION_WARN) {
 		return;
 	}
 
-	log_warn("the index fills %.1f%% of the %u bit label space, so roughly %.1f%% of read cores will match by chance", 100.0 * occupancy, (unsigned)(sizeof(lcp_label) * 8), 100.0 * occupancy);
+	log_warn("the index fills %.1f%% of the key space, so roughly %.1f%% of read cores will match by chance", 100.0 * occupancy, 100.0 * occupancy);
 	log_warn("a read with %d cores then carries a spurious hit %.0f%% of the time; consider --min-ratio below 1.0 and --min-hits above 1", CAMIL_COLLISION_READ_CORES, 100.0 * (1.0 - pow(1.0 - occupancy, CAMIL_COLLISION_READ_CORES)));
 }

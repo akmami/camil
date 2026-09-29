@@ -38,6 +38,7 @@ struct camil_opts {
 	int lcp_level; // -l, LCP level for references and reads alike
 	int max_share; // -n, genomes a core may occur in and still be indexed
 	int threads;   // -t, worker threads
+	uint32_t margin; // --margin, flanking bases folded into every core key
 	int use_rc;    // cleared by --no-rc
 	int verbose;   // -v
 

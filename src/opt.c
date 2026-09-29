@@ -271,12 +271,15 @@ void camil_usage_command(FILE *out, enum camil_command command) {
 		        "  -G, --genome-list FILE    read genomes from a tab separated file, one\n"
 		        "                            'path <tab> name' per line, the name optional\n"
 		        "  -l, --level INT           LCP level (default %d)\n"
-		        "  -n, --max-share INT       genomes a core may occur in, 1 to %d (default 1)\n"
+		        "  -n, --max-share INT       species a core may occur in (default 1)\n"
 		        "  -t, --threads INT         worker threads (default %d)\n"
+		        "      --margin INT          flanking bases folded into every core key,\n"
+		        "                            raising specificity at the cost of sensitivity\n"
+		        "                            (default 0)\n"
 		        "      --no-rc               do not index reverse complements\n"
 		        "  -v, --verbose             print debug messages\n"
 		        "  -h, --help                show this message\n",
-		        CAMIL_DEFAULT_LEVEL, CAMIL_MAX_SHARE, CAMIL_DEFAULT_THREADS);
+		        CAMIL_DEFAULT_LEVEL, CAMIL_DEFAULT_THREADS);
 		break;
 	case CAMIL_CMD_CLASSIFY:
 		fprintf(out,
@@ -318,15 +321,18 @@ void camil_usage_command(FILE *out, enum camil_command command) {
 		        "  -s, --summary FILE        summary table (default stdout)\n"
 		        "      --save-index FILE     also write the index to this file\n"
 		        "  -l, --level INT           LCP level (default %d)\n"
-		        "  -n, --max-share INT       genomes a core may occur in, 1 to %d (default 1)\n"
+		        "  -n, --max-share INT       species a core may occur in (default 1)\n"
 		        "  -t, --threads INT         worker threads (default %d)\n"
+		        "      --margin INT          flanking bases folded into every core key,\n"
+		        "                            raising specificity at the cost of sensitivity\n"
+		        "                            (default 0)\n"
 		        "      --no-rc               do not index reverse complements\n"
 		        "      --min-hits INT        minimum cores supporting the winner (default 1)\n"
 		        "      --min-ratio FLOAT     share of matched cores the winner must hold,\n"
 		        "                            between 0 and 1 (default 1.0)\n"
 		        "  -v, --verbose             print debug messages\n"
 		        "  -h, --help                show this message\n",
-		        CAMIL_DEFAULT_LEVEL, CAMIL_MAX_SHARE, CAMIL_DEFAULT_THREADS);
+		        CAMIL_DEFAULT_LEVEL, CAMIL_DEFAULT_THREADS);
 		break;
 	default:
 		camil_usage(out);
@@ -350,8 +356,8 @@ static int opt_validate(const struct camil_opts *opts) {
 		log_error("the LCP level must be at least 1");
 		return -1;
 	}
-	if (opts->max_share < 1 || opts->max_share > CAMIL_MAX_SHARE) {
-		log_error("--max-share must be between 1 and %d", CAMIL_MAX_SHARE);
+	if (opts->max_share < 1 || (uint32_t)opts->max_share > CAMIL_MAX_SHARE) {
+		log_error("--max-share must be between 1 and %u", CAMIL_MAX_SHARE);
 		return -1;
 	}
 	if (opts->threads < 1) {
@@ -496,6 +502,17 @@ int camil_opts_parse(struct camil_opts *opts, int argc, char **argv) {
 				return -1;
 			}
 			opts->threads = (int)number;
+			continue;
+		}
+		if (opt_is(arg, NULL, "--margin")) {
+			if ((value = opt_value(argc, argv, &i, arg)) == NULL || opt_int(value, arg, &number) != 0) {
+				return -1;
+			}
+			if (number < 0) {
+				log_error("--margin cannot be negative");
+				return -1;
+			}
+			opts->margin = (uint32_t)number;
 			continue;
 		}
 		if (opt_is(arg, NULL, "--min-hits")) {
