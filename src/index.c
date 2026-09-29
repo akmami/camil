@@ -211,12 +211,16 @@ static int index_add_genome(struct index_builder *builder, const char *path, cam
 
 	// A genome that cannot be opened keeps its species id and name so that the
 	// numbering of everything after it is unaffected; it simply owns no core.
-	// seq_open() has already said which file and why.
-	file = seq_open(path);
-	if (file == NULL) {
-		log_warn("skipping %s (%s), it contributes no cores", builder->names[sid], path);
+	// With tens of thousands of genomes the per file message is debug output;
+	// the count is reported once collection is over.
+	if (!seq_readable(path)) {
+		log_debug("skipping %s (%s): cannot open it, it contributes no cores", builder->names[sid], path);
 		builder->nskipped++;
 		return 0;
+	}
+	file = seq_open(path);
+	if (file == NULL) {
+		return -1;
 	}
 
 	pthread_mutex_lock(&builder->stats_mutex);
@@ -283,7 +287,7 @@ static int index_add_genome(struct index_builder *builder, const char *path, cam
 	pthread_mutex_unlock(&builder->stats_mutex);
 
 	if (status == 0) {
-		log_info("indexed %s (%s): %llu sequences, %llu bases, %llu cores", builder->names[sid], path, (unsigned long long)builder->nseq, (unsigned long long)builder->nbases, (unsigned long long)builder->ncores);
+		log_debug("indexed %s (%s): %llu sequences, %llu bases, %llu cores", builder->names[sid], path, (unsigned long long)builder->nseq, (unsigned long long)builder->nbases, (unsigned long long)builder->ncores);
 	}
 
 	return status;
@@ -366,7 +370,7 @@ static int index_resolve_names(char ***names_out, const struct camil_genome *gen
 		}
 
 		names[i] = candidate;
-		log_info("species %u: %s (%s)", i, names[i], genomes[i].path);
+		log_debug("species %u: %s (%s)", i, names[i], genomes[i].path);
 	}
 
 	return 0;
@@ -424,7 +428,7 @@ static int index_collect(struct index_builder *builder, char ***names, const str
 	}
 
 	if (builder->nskipped > 0) {
-		log_warn("%u of %u genomes could not be opened and were skipped", builder->nskipped, ngenomes);
+		log_warn("%u of %u genomes could not be opened and were skipped (run with --verbose to see which)", builder->nskipped, ngenomes);
 	}
 	log_info("collected %llu core occurrences, reducing", (unsigned long long)cbuild_count(&builder->table));
 	return 0;
@@ -688,8 +692,10 @@ void camil_index_report(const struct camil_index *index) {
 	uint32_t i;
 
 	log_info("index: LCP level %d, sharing limit %d, reverse complement %s", index->lcp_level, index->max_share, index->use_rc ? "on" : "off");
-	for (i = 0; i < index->ngenomes; i++) {
-		log_info("  species %u: %s", i, index->names[i]);
+	if (log_is_verbose()) {
+		for (i = 0; i < index->ngenomes; i++) {
+			log_debug("  species %u: %s", i, index->names[i]);
+		}
 	}
 	log_info("index: %llu cores, about %llu MiB in memory", (unsigned long long)ctable_size(&index->table), (unsigned long long)(ctable_memory(&index->table) / (1024ull * 1024ull)));
 

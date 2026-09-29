@@ -25,7 +25,7 @@ void log_set_verbose(int verbose);
 // returns nonzero when debug level messages are enabled
 int log_is_verbose(void);
 
-// emits a progress message. Intended for milestones a user cares about
+// emits a progress message. Only shown with --verbose, like log_debug(); warnings and errors are always printed
 void log_info(const char *fmt, ...) CAMIL_PRINTF(1, 2);
 
 // emits a recoverable problem, for example an unreadable input file that is skipped rather than aborting the whole run

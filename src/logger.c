@@ -4,7 +4,8 @@
 // guards the output stream so that concurrently logging worker threads do not interleave partial lines
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// set to nonzero by log_set_verbose() to unlock debug messages
+// set to nonzero by log_set_verbose(). Without it only warnings and errors
+// are printed; progress (INFO) and detail (DEBUG) need --verbose.
 static int log_verbose = 0;
 
 // wall clock reading taken the first time log_elapsed() runs; all reported timestamps are relative to it
@@ -54,6 +55,9 @@ static void log_emit(const char *level, const char *fmt, va_list ap) {
 
 void log_info(const char *fmt, ...) {
 	va_list ap;
+	if (!log_verbose) {
+		return;
+	}
 	va_start(ap, fmt);
 	log_emit("INFO", fmt, ap);
 	va_end(ap);

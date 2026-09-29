@@ -126,7 +126,7 @@ Names must stay unique or two rows of a summary would be indistinguishable. The 
 | `--save-index FILE` | run | also write the index |
 | `--min-hits INT` | classify, run | cores the winner needs (default 1) |
 | `--min-ratio FLOAT` | classify, run | share of matched cores the winner must hold (default 1.0) |
-| `-v, --verbose` | all | debug messages |
+| `-v, --verbose` | all | print progress and debug messages; without it only warnings and errors are printed |
 
 ### Output
 

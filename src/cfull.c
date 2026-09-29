@@ -428,9 +428,9 @@ void cfull_report(const struct cfull *full) {
 	uint32_t i;
 
 	log_info("full index: LCP level %d, reverse complement %s, %u species", full->lcp_level, full->use_rc ? "on" : "off", full->ngenomes);
-	if (full->ngenomes <= 64) {
+	if (log_is_verbose()) {
 		for (i = 0; i < full->ngenomes; i++) {
-			log_info("  species %u: %s", i, full->names[i]);
+			log_debug("  species %u: %s", i, full->names[i]);
 		}
 	}
 	log_info("full index: %llu cores, %llu species occurrences, about %llu MiB in memory", (unsigned long long)cfull_size(full), (unsigned long long)full->nsids, (unsigned long long)(cfull_memory(full) / (1024ull * 1024ull)));
@@ -503,7 +503,7 @@ int cfull_subset(const struct cfull *full, char *const *names, uint32_t nnames, 
 			status = -1;
 			goto done;
 		}
-		log_info("species %u: %s (was %lld)", i, index->names[i], (long long)old);
+		log_debug("species %u: %s (was %lld)", i, index->names[i], (long long)old);
 	}
 	index->ngenomes = nnames;
 	index->lcp_level = full->lcp_level;
